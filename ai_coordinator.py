@@ -29,41 +29,200 @@ class AICoordinatorWorker(QObject):
     def run(self):
         """执行AI分析任务"""
         try:
-            # 检查数据量是否过大，需要分批处理
-            total_content_length = sum(len(str(item.get('content', ''))) for item in self.prompt_data)
+            # 首先检查数据中是否包含分块标记
+            has_chunks = any(item.get('type') in ['CHUNK_START', 'CHUNK_COMPLETE', 'CHUNK_SUMMARY'] for item in self.prompt_data)
             
-            # 如果内容超过50KB，使用分批处理
-            if total_content_length > 50000:
-                print(f"检测到大数据包({total_content_length}bytes)，使用分批处理...")
-                result = self.process_in_batches()
+            if has_chunks:
+                print("[AI分析] 检测到分块数据，使用分块模式处理...")
+                result = self.process_chunked_data()
             else:
-                # 小数据量直接处理
-                prompt = self.construct_prompt()
-                api_result = self.call_iflow_model(prompt)
+                # 检查数据量是否过大，需要分批处理
+                total_content_length = sum(len(str(item.get('content', ''))) for item in self.prompt_data)
                 
-                # 规范化返回格式：转换flags_with_reasons为字符串列表
-                flags_list = []
-                if "flags" in api_result:
-                    for flag_info in api_result["flags"]:
-                        if isinstance(flag_info, dict):
-                            flag_content = flag_info.get('flag', '').strip()
-                        else:
-                            flag_content = str(flag_info).strip()
-                        if flag_content:
-                            flags_list.append(flag_content)
-                
-                result = {
-                    "flags": flags_list,  # ✅ 统一为字符串列表
-                    "raw_response": api_result.get("raw_response", ""),
-                    "status": api_result.get("status", "success"),
-                    "analysis": f"单次处理完成，发现{len(flags_list)}个可疑flag"
-                }
+                # 如果内容超过50KB，使用分批处理
+                if total_content_length > 50000:
+                    print(f"[AI分析] 检测到大数据包({total_content_length}bytes)，使用分批处理...")
+                    result = self.process_in_batches()
+                else:
+                    # 小数据量直接处理
+                    prompt = self.construct_prompt()
+                    api_result = self.call_iflow_model(prompt)
+                    
+                    # 规范化返回格式：转换flags_with_reasons为字符串列表
+                    flags_list = []
+                    if "flags" in api_result:
+                        for flag_info in api_result["flags"]:
+                            if isinstance(flag_info, dict):
+                                flag_content = flag_info.get('flag', '').strip()
+                            else:
+                                flag_content = str(flag_info).strip()
+                            if flag_content:
+                                flags_list.append(flag_content)
+                    
+                    result = {
+                        "flags": flags_list,  # ✅ 统一为字符串列表
+                        "raw_response": api_result.get("raw_response", ""),
+                        "status": api_result.get("status", "success"),
+                        "analysis": f"单次处理完成，发现{len(flags_list)}个可疑flag"
+                    }
             
             self.finished.emit(result)
         except Exception as e:
             self.error.emit(str(e))
     
-    def process_in_batches(self):
+    def process_chunked_data(self):
+        """处理分块数据的AI分析"""
+        print("[分块处理] 开始处理分块数据...")
+        
+        # 将数据按块分组
+        chunks = {}
+        chunk_order = []
+        all_flags = []
+        chunk_summaries = []
+        
+        for item in self.prompt_data:
+            item_type = item.get('type', '')
+            
+            if item_type == 'CHUNK_START':
+                chunk_id = item.get('chunk_id', 0)
+                if chunk_id not in chunks:
+                    chunks[chunk_id] = []
+                    chunk_order.append(chunk_id)
+            elif item_type == 'CHUNK_COMPLETE':
+                continue  # 跳过标记
+            elif item_type == 'CHUNK_SUMMARY':
+                continue  # 跳过标记
+            elif item_type not in ['ANALYSIS_PROCESS']:
+                # 该项属于最近的块
+                if chunk_order:
+                    current_chunk = chunk_order[-1]
+                    chunks[current_chunk].append(item)
+        
+        total_chunks = len(chunks)
+        print(f"[分块处理] 检测到 {total_chunks} 块数据")
+        
+        # 逐块分析
+        for block_num, chunk_id in enumerate(chunk_order, 1):
+            chunk_items = chunks[chunk_id]
+            
+            if not chunk_items:
+                continue
+            
+            print(f"[分块处理] 分析第 {block_num}/{total_chunks} 块...")
+            
+            # 为这一块构造提示词
+            chunk_prompt = self._construct_chunk_prompt(chunk_items, chunk_id, total_chunks, chunk_summaries)
+            
+            try:
+                api_result = self.call_iflow_model(chunk_prompt)
+                flags = self.extract_flags_from_result(api_result)
+                all_flags.extend(flags)
+                
+                # 保存块的总结（用于后续块的上下文）
+                summary = api_result.get("raw_response", "")[:300]
+                chunk_summaries.append(f"块{chunk_id}: 发现flag-{flags}，内容摘要-{summary}")
+                
+                print(f"[分块处理] 块 {chunk_id} 完成，发现 {len(flags)} 个flag")
+                
+            except Exception as e:
+                print(f"[分块处理] 块 {chunk_id} 分析失败: {str(e)}")
+                continue
+        
+        # 最后的综合分析
+        synthesis_prompt = f"""
+【综合分析总结】
+已完成对所有 {total_chunks} 块数据包的逐块分析。
+
+各块发现的内容：
+{chr(10).join(chunk_summaries) if chunk_summaries else '暂无'}
+
+目前发现的所有可疑flag/哈希值：
+{', '.join(all_flags) if all_flags else '暂无'}
+
+请给出最终的综合分析：
+1. 确认的flag列表
+2. 各flag的发现块号和理由
+3. 是否有关联的流量特征
+4. 最终建议
+"""
+        
+        print("[分块处理] 执行最终综合分析...")
+        
+        try:
+            final_result = self.call_iflow_model(synthesis_prompt)
+            final_flags = self.extract_flags_from_result(final_result)
+            
+            # 合并所有发现的flag
+            all_flags.extend(final_flags)
+            unique_flags = list(set(all_flags))
+            
+            return {
+                "flags": unique_flags,
+                "raw_response": final_result.get("raw_response", ""),
+                "status": "success_chunked",
+                "total_chunks": total_chunks,
+                "analysis": f"分块分析完成（{total_chunks}块），共发现 {len(unique_flags)} 个可疑flag"
+            }
+        except Exception as e:
+            print(f"[分块处理] 综合分析失败: {str(e)}")
+            return {
+                "flags": all_flags,
+                "raw_response": "",
+                "status": "partial_success",
+                "total_chunks": total_chunks,
+                "analysis": f"分块分析部分完成，共发现 {len(all_flags)} 个可疑flag"
+            }
+    
+    def _construct_chunk_prompt(self, chunk_items, chunk_id, total_chunks, previous_summaries):
+        """为单个数据块构造AI分析提示词"""
+        prompt = f"【数据块 {chunk_id}/{total_chunks}】\n"
+        
+        # 如果有前面块的信息，添加到上下文
+        if previous_summaries:
+            prompt += "\n【前面块的分析总结】\n"
+            for summary in previous_summaries[-2:]:  # 只保留最近2块的总结
+                prompt += f"- {summary}\n"
+            prompt += "\n"
+        
+        # 添加当前块的数据
+        prompt += "【当前块的原始数据】\n"
+        
+        # 按优先级显示数据
+        flag_matches = [item for item in chunk_items if item.get('type') == 'FLAG_REGEX_MATCH']
+        hex_dumps = [item for item in chunk_items if item.get('type') == 'HEX_DUMP']
+        all_data = [item for item in chunk_items if item.get('type') == 'ALL_DATA']
+        
+        # 显示flag匹配结果（最重要）
+        if flag_matches:
+            prompt += f"\n正则匹配到的可疑内容（{len(flag_matches)}条）:\n"
+            for item in flag_matches[:10]:  # 最多显示10条
+                prompt += f"- {item.get('match', '')}\n"
+        
+        # 显示十六进制数据
+        if hex_dumps:
+            prompt += f"\n十六进制数据包（{len(hex_dumps)}条）:\n"
+            for item in hex_dumps[:5]:  # 最多显示5条
+                prompt += f"- {item.get('content', '')}\n"
+        
+        # 显示其他数据
+        if all_data:
+            prompt += f"\n其他提取的数据（{len(all_data)}条）:\n"
+            for item in all_data[:5]:  # 最多显示5条
+                prompt += f"- {item.get('content', '')}\n"
+        
+        # 添加分析任务
+        prompt += f"\n【分析任务】\n"
+        prompt += f"请分析这一块的数据，查找：\n"
+        prompt += f"1. 所有的flag格式内容 (flag{{}}, FLAG{{}}, ctf{{}}, 等)\n"
+        prompt += f"2. 可疑的哈希值或加密文本\n"
+        prompt += f"3. 特殊的协议行为或数据流特征\n"
+        prompt += f"4. 任何看起来异常的内容\n\n"
+        
+        if self.user_prompt:
+            prompt += f"【用户要求】\n{self.user_prompt}\n"
+        
+        return prompt
+
         """分批处理大数据包"""
         # 按每个批次最多30KB计算分批数量
         batch_size = 30000

@@ -12,6 +12,7 @@ import json
 import pyshark
 import asyncio
 import platform
+import os
 
 
 class PcapAnalyzerWorker(QObject):
@@ -39,7 +40,18 @@ class PcapAnalyzerWorker(QObject):
             print(f"开始分析PCAP文件: {self.pcap_file}")
             print("=" * 50)
             
-            results = self.analyze_pcap()
+            # 检查文件大小，决定是否使用分块模式
+            file_size = os.path.getsize(self.pcap_file)
+            print(f"文件大小: {file_size / 1024 / 1024:.2f} MB")
+            
+            # 如果文件超过5MB，使用分块分析
+            if file_size > 5 * 1024 * 1024:
+                print("检测到大文件，使用分块分析模式")
+                results = self.analyze_pcap_chunked()
+            else:
+                print("使用标准分析模式")
+                results = self.analyze_pcap()
+            
             # 将分析过程添加到结果中
             results.append({"type": "ANALYSIS_PROCESS", "content": json.dumps(self.analysis_process, ensure_ascii=False)})
             
@@ -162,6 +174,230 @@ class PcapAnalyzerWorker(QObject):
             print(f"关闭capture对象时出错: {str(e)}")
         
         self.analysis_process.append({"step": "分析完成", "details": f"分析完成，共发现{len(results)}条记录"})
+        return results
+    
+    def analyze_pcap_chunked(self, chunk_size=50):
+        """
+        分块分析PCAP文件
+        将大文件分成多个块，逐块分析以避免内存溢出和token超限
+        """
+        results = []
+        cap = None
+        
+        self.analysis_process.append({"step": "分块分析开始", "details": f"开始分块分析PCAP文件，每块{chunk_size}个数据包"})
+        
+        try:
+            # 首先加载所有数据包
+            cap = pyshark.FileCapture(self.pcap_file, keep_packets=False, use_json=True)
+            
+            packets = []
+            try:
+                print("正在加载所有数据包...")
+                for packet in cap:
+                    packets.append(packet)
+                    if len(packets) % 100 == 0:
+                        print(f"已加载 {len(packets)} 个数据包")
+            except Exception as e:
+                print(f"加载数据包时出错: {str(e)}")
+                self.analysis_process.append({"step": "数据包加载", "details": f"加载了{len(packets)}个数据包"})
+            
+            if cap:
+                cap.close()
+            
+            if not packets:
+                self.analysis_process.append({"step": "分块分析", "details": "没有找到任何数据包"})
+                return results
+            
+            total_packets = len(packets)
+            total_chunks = (total_packets + chunk_size - 1) // chunk_size
+            
+            self.analysis_process.append({"step": "分块分析", "details": f"总共{total_packets}个数据包，分为{total_chunks}块"})
+            print(f"[分块分析] 总共 {total_packets} 个数据包，分为 {total_chunks} 块")
+            
+            # 逐块分析
+            for chunk_id in range(total_chunks):
+                start_idx = chunk_id * chunk_size
+                end_idx = min((chunk_id + 1) * chunk_size, total_packets)
+                chunk_packets = packets[start_idx:end_idx]
+                
+                print(f"[分块分析] 处理块 {chunk_id + 1}/{total_chunks} (包 #{start_idx + 1}-#{end_idx})")
+                
+                # 分析这一块
+                chunk_results = self._analyze_chunk(chunk_packets, chunk_id + 1, total_chunks)
+                results.extend(chunk_results)
+                
+                # 添加块完成的标记
+                results.append({
+                    "type": "CHUNK_COMPLETE",
+                    "chunk_id": chunk_id + 1,
+                    "total_chunks": total_chunks,
+                    "packet_range": f"#{start_idx + 1}-#{end_idx}",
+                    "content": f"块 {chunk_id + 1} 分析完成，处理 {end_idx - start_idx} 个数据包"
+                })
+            
+            self.analysis_process.append({"step": "分块分析完成", "details": f"完成分块分析，共 {total_chunks} 块"})
+            
+        except Exception as e:
+            self.analysis_process.append({"step": "分块分析错误", "details": f"分块分析出错: {str(e)}"})
+            print(f"分块分析出错: {str(e)}")
+            raise
+        finally:
+            try:
+                if cap:
+                    cap.close()
+            except:
+                pass
+        
+        return results
+    
+    def _analyze_chunk(self, chunk_packets, chunk_id, total_chunks):
+        """
+        分析单个数据块
+        提取该块中所有可疑内容供AI分析
+        """
+        results = []
+        
+        # 添加块头
+        results.append({
+            "type": "CHUNK_START",
+            "chunk_id": chunk_id,
+            "total_chunks": total_chunks,
+            "packet_count": len(chunk_packets),
+            "content": f"\n{'='*60}\n【数据块 {chunk_id}/{total_chunks}】\n包含 {len(chunk_packets)} 个数据包\n{'='*60}\n"
+        })
+        
+        # 对该块的数据包进行标准分析
+        try:
+            # 1. 查找flag（正则匹配）
+            for packet in chunk_packets:
+                try:
+                    src_ip = getattr(packet.ip, 'src', 'N/A') if hasattr(packet, 'ip') else 'N/A'
+                    dst_ip = getattr(packet.ip, 'dst', 'N/A') if hasattr(packet, 'ip') else 'N/A'
+                    
+                    # 收集所有可能包含数据的内容
+                    packet_contents = []
+                    
+                    if hasattr(packet, 'tcp') and hasattr(packet.tcp, 'payload'):
+                        packet_contents.append(str(getattr(packet.tcp, 'payload', '')))
+                    elif hasattr(packet, 'udp') and hasattr(packet.udp, 'payload'):
+                        packet_contents.append(str(getattr(packet.udp, 'payload', '')))
+                    
+                    if hasattr(packet, 'http'):
+                        if hasattr(packet.http, 'file_data'):
+                            packet_contents.append(str(getattr(packet.http, 'file_data', '')))
+                        if hasattr(packet.http, 'request_uri'):
+                            packet_contents.append(str(getattr(packet.http, 'request_uri', '')))
+                    
+                    if hasattr(packet, 'data'):
+                        packet_contents.append(str(getattr(packet.data, 'data', '')))
+                    
+                    # 正则匹配
+                    flag_patterns = [
+                        r'flag\{[^}]+\}',
+                        r'FLAG\{[^}]+\}',
+                        r'ctf\{[^}]+\}',
+                        r'CTF\{[^}]+\}',
+                        r'[A-Za-z0-9_]{20,}',
+                        r'[a-f0-9]{32}',
+                        r'[a-f0-9]{40}',
+                        r'[a-f0-9]{64}',
+                    ]
+                    
+                    for content in packet_contents:
+                        for pattern in flag_patterns:
+                            matches = re.findall(pattern, content, re.IGNORECASE)
+                            for match in matches:
+                                decoded_match = match
+                                try:
+                                    if all(c in '0123456789abcdefABCDEF' for c in match.replace(':', '')):
+                                        decoded_match = bytes.fromhex(match.replace(':', '')).decode('utf-8', errors='ignore')
+                                except:
+                                    pass
+                                
+                                results.append({
+                                    "type": "FLAG_REGEX_MATCH",
+                                    "src": src_ip,
+                                    "dst": dst_ip,
+                                    "match": decoded_match,
+                                    "content": f"Frame {packet.frame_info.number}: 正则匹配到可能的flag: {decoded_match}"
+                                })
+                except:
+                    continue
+            
+            # 2. 提取十六进制dump（完整的包数据）
+            for i, packet in enumerate(chunk_packets):
+                try:
+                    src_ip = getattr(packet.ip, 'src', 'N/A') if hasattr(packet, 'ip') else 'N/A'
+                    dst_ip = getattr(packet.ip, 'dst', 'N/A') if hasattr(packet, 'ip') else 'N/A'
+                    src_port = 'N/A'
+                    dst_port = 'N/A'
+                    
+                    if hasattr(packet, 'tcp'):
+                        src_port = getattr(packet.tcp, 'srcport', 'N/A')
+                        dst_port = getattr(packet.tcp, 'dstport', 'N/A')
+                    elif hasattr(packet, 'udp'):
+                        src_port = getattr(packet.udp, 'srcport', 'N/A')
+                        dst_port = getattr(packet.udp, 'dstport', 'N/A')
+                    
+                    # 获取十六进制数据（限制大小）
+                    hex_data = ""
+                    try:
+                        raw_packet = packet.get_raw_packet().hex()
+                        hex_data = ' '.join([raw_packet[i:i+2] for i in range(0, min(len(raw_packet), 400), 2)])
+                    except:
+                        pass
+                    
+                    if hex_data:
+                        results.append({
+                            "type": "HEX_DUMP",
+                            "src": f"{src_ip}:{src_port}",
+                            "dst": f"{dst_ip}:{dst_port}",
+                            "content": f"Frame {packet.frame_info.number} ({packet.frame_info.len} bytes): {hex_data}{'...' if len(raw_packet) > 400 else ''}"
+                        })
+                except:
+                    continue
+            
+            # 3. 提取全部数据
+            for packet in chunk_packets:
+                try:
+                    src_ip = getattr(packet.ip, 'src', 'N/A') if hasattr(packet, 'ip') else 'N/A'
+                    dst_ip = getattr(packet.ip, 'dst', 'N/A') if hasattr(packet, 'ip') else 'N/A'
+                    
+                    data_content = 'N/A'
+                    if hasattr(packet, 'data'):
+                        data_content = getattr(packet.data, 'data', 'N/A')
+                    elif hasattr(packet, 'tcp') and hasattr(packet.tcp, 'payload'):
+                        data_content = getattr(packet.tcp, 'payload', 'N/A')
+                    elif hasattr(packet, 'http') and hasattr(packet.http, 'file_data'):
+                        data_content = getattr(packet.http, 'file_data', 'N/A')
+                    
+                    if data_content != 'N/A':
+                        decoded_data = data_content
+                        try:
+                            if isinstance(data_content, str) and all(c in '0123456789abcdefABCDEF' for c in data_content.replace(':', '')):
+                                decoded_data = bytes.fromhex(data_content.replace(':', '')).decode('utf-8', errors='ignore')
+                        except:
+                            pass
+                        
+                        results.append({
+                            "type": "ALL_DATA",
+                            "src": src_ip,
+                            "dst": dst_ip,
+                            "content": f"Frame {packet.frame_info.number}: {decoded_data[:200]}{'...' if len(decoded_data) > 200 else ''}"
+                        })
+                except:
+                    continue
+        
+        except Exception as e:
+            print(f"分析块 {chunk_id} 时出错: {str(e)}")
+        
+        # 添加块尾
+        results.append({
+            "type": "CHUNK_SUMMARY",
+            "chunk_id": chunk_id,
+            "content": f"【块 {chunk_id} 分析完成】 提取 {len([r for r in results if r['type'] in ['FLAG_REGEX_MATCH', 'HEX_DUMP', 'ALL_DATA']])} 条记录\n"
+        })
+        
         return results
     
     def export_all_data(self, cap):
