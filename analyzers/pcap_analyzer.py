@@ -13,6 +13,9 @@ import pyshark
 import asyncio
 import platform
 import os
+import tempfile
+import shutil
+from pathlib import Path
 
 
 class PcapAnalyzerWorker(QObject):
@@ -44,13 +47,9 @@ class PcapAnalyzerWorker(QObject):
             file_size = os.path.getsize(self.pcap_file)
             print(f"文件大小: {file_size / 1024 / 1024:.2f} MB")
             
-            # 如果文件超过5MB，使用分块分析
-            if file_size > 5 * 1024 * 1024:
-                print("检测到大文件，使用分块分析模式")
-                results = self.analyze_pcap_chunked()
-            else:
-                print("使用标准分析模式")
-                results = self.analyze_pcap()
+            # 使用统一的分块分析模式
+            print("使用分块分析模式处理PCAP文件")
+            results = self.analyze_pcap()
             
             # 将分析过程添加到结果中
             results.append({"type": "ANALYSIS_PROCESS", "content": json.dumps(self.analysis_process, ensure_ascii=False)})
@@ -78,11 +77,12 @@ class PcapAnalyzerWorker(QObject):
     
     def analyze_pcap(self):
         """
-        分析PCAP文件
-        返回包含发现的flag相关数据的列表
+        分析PCAP文件（非分块模式）
+        返回包含所有数据包完整JSON的列表
         """
         results = []
         cap = None
+        packets = []
         
         # 记录分析步骤
         self.analysis_process.append({"step": "开始分析", "details": f"开始分析PCAP文件: {self.pcap_file}"})
@@ -91,123 +91,30 @@ class PcapAnalyzerWorker(QObject):
         try:
             # 在工作线程中创建pyshark.FileCapture，禁用异步以避免事件循环问题
             cap = pyshark.FileCapture(self.pcap_file, keep_packets=False, use_json=True)
-            # 首先统计包的数量
-            packet_count = 0
+            # 加载所有数据包到内存
             try:
-                packet_count = sum(1 for _ in cap)
+                packets = list(cap)
+                packet_count = len(packets)
             except Exception as count_e:
-                print(f"统计数据包数量时出错（继续处理）: {str(count_e)}")
-                packet_count = "未知"
-            
-            # 重新创建cap以进行分析
-            cap = pyshark.FileCapture(self.pcap_file, keep_packets=False, use_json=True)
-            self.analysis_process.append({"step": "环境检查", "details": f"pyshark库可用，成功加载PCAP文件，共{packet_count}个数据包"})
-        except Exception as e:
-            self.analysis_process.append({"step": "环境检查", "details": f"pyshark库不可用或无法加载PCAP文件: {str(e)}"})
-            raise Exception(f"无法加载PCAP文件: {str(e)}")
-        
-        # 尝试使用pyshark进行分析
-        # 优先级顺序：正则匹配FLAG > TCP流详情 > HTTP流 > 其他数据
-        
-        # 1. 查找包含flag的内容（正则匹配 - 优先级最高）
-        flag_results = []
-        try:
-            flag_results = self.search_flag_in_pcap(cap)
-            results.extend(flag_results)
-        except Exception as e:
-            print(f"搜索FLAG出错（继续处理）: {str(e)}")
-            self.analysis_process.append({"step": "FLAG搜索", "details": f"FLAG搜索出错: {str(e)}"})
-        
-        # 2. 提取TCP流详细信息（提供详细的协议字段和完整内容）
-        try:
-            tcp_results = self.extract_tcp_streams_detailed(cap)
-            results.extend(tcp_results)
-        except Exception as e:
-            print(f"提取TCP流出错（继续处理）: {str(e)}")
-            self.analysis_process.append({"step": "TCP流提取", "details": f"TCP流提取出错: {str(e)}"})
-        
-        # 3. 获取HTTP流信息
-        try:
-            http_results = self.extract_http_streams(cap)
-            results.extend(http_results)
-        except Exception as e:
-            print(f"提取HTTP流出错（继续处理）: {str(e)}")
-            self.analysis_process.append({"step": "HTTP流提取", "details": f"HTTP流提取出错: {str(e)}"})
-        
-        # 4. 获取HTTP完整内容
-        try:
-            http_content_results = self.extract_http_content(cap)
-            results.extend(http_content_results)
-        except Exception as e:
-            print(f"提取HTTP内容出错（继续处理）: {str(e)}")
-            self.analysis_process.append({"step": "HTTP内容提取", "details": f"HTTP内容提取出错: {str(e)}"})
-        
-        # 5. 获取DNS查询信息
-        try:
-            dns_results = self.extract_dns_queries(cap)
-            results.extend(dns_results)
-        except Exception as e:
-            print(f"提取DNS查询出错（继续处理）: {str(e)}")
-            self.analysis_process.append({"step": "DNS查询提取", "details": f"DNS查询提取出错: {str(e)}"})
-        
-        # 6. 获取ICMP数据
-        try:
-            icmp_results = self.extract_icmp_data(cap)
-            results.extend(icmp_results)
-        except Exception as e:
-            print(f"提取ICMP数据出错（继续处理）: {str(e)}")
-            self.analysis_process.append({"step": "ICMP数据提取", "details": f"ICMP数据提取出错: {str(e)}"})
-        
-        # 7. 导出所有数据供AI参考分析（优先级最低，但包含所有数据）
-        try:
-            all_data_results = self.export_all_data(cap)
-            results.extend(all_data_results)
-        except Exception as e:
-            print(f"导出所有数据出错（继续处理）: {str(e)}")
-            self.analysis_process.append({"step": "导出数据", "details": f"导出数据出错: {str(e)}"})
-        
-        # 关闭capture对象
-        try:
-            if cap:
-                cap.close()
-        except Exception as e:
-            print(f"关闭capture对象时出错: {str(e)}")
-        
-        self.analysis_process.append({"step": "分析完成", "details": f"分析完成，共发现{len(results)}条记录"})
-        return results
-    
-    def analyze_pcap_chunked(self, chunk_size=50):
-        """
-        分块分析PCAP文件
-        将大文件分成多个块，逐块分析以避免内存溢出和token超限
-        """
-        results = []
-        cap = None
-        
-        self.analysis_process.append({"step": "分块分析开始", "details": f"开始分块分析PCAP文件，每块{chunk_size}个数据包"})
-        
-        try:
-            # 首先加载所有数据包
-            cap = pyshark.FileCapture(self.pcap_file, keep_packets=False, use_json=True)
-            
-            packets = []
-            try:
-                print("正在加载所有数据包...")
-                for packet in cap:
-                    packets.append(packet)
-                    if len(packets) % 100 == 0:
-                        print(f"已加载 {len(packets)} 个数据包")
-            except Exception as e:
-                print(f"加载数据包时出错: {str(e)}")
+                print(f"加载数据包时出错: {str(count_e)}")
                 self.analysis_process.append({"step": "数据包加载", "details": f"加载了{len(packets)}个数据包"})
             
             if cap:
                 cap.close()
             
             if not packets:
-                self.analysis_process.append({"step": "分块分析", "details": "没有找到任何数据包"})
+                self.analysis_process.append({"step": "数据包加载", "details": "没有找到任何数据包"})
                 return results
             
+            self.analysis_process.append({"step": "环境检查", "details": f"pyshark库可用，成功加载PCAP文件，共{packet_count}个数据包"})
+        except Exception as e:
+            self.analysis_process.append({"step": "环境检查", "details": f"pyshark库不可用或无法加载PCAP文件: {str(e)}"})
+            raise Exception(f"无法加载PCAP文件: {str(e)}")
+        
+        # 分块处理数据包
+        try:
+            # 分块处理
+            chunk_size = 50
             total_packets = len(packets)
             total_chunks = (total_packets + chunk_size - 1) // chunk_size
             
@@ -236,7 +143,7 @@ class PcapAnalyzerWorker(QObject):
                 })
             
             self.analysis_process.append({"step": "分块分析完成", "details": f"完成分块分析，共 {total_chunks} 块"})
-            
+        
         except Exception as e:
             self.analysis_process.append({"step": "分块分析错误", "details": f"分块分析出错: {str(e)}"})
             print(f"分块分析出错: {str(e)}")
@@ -248,14 +155,21 @@ class PcapAnalyzerWorker(QObject):
             except:
                 pass
         
+        self.analysis_process.append({"step": "分析完成", "details": f"分析完成，共发现{len(results)}条记录"})
         return results
     
     def _analyze_chunk(self, chunk_packets, chunk_id, total_chunks):
         """
         分析单个数据块
         提取该块中所有可疑内容供AI分析
+        将JSON保存到tmp文件夹以节省内存
         """
         results = []
+        
+        # 创建tmp文件夹（如果不存在）
+        tmp_dir = Path("tmp")
+        if not tmp_dir.exists():
+            tmp_dir.mkdir(exist_ok=True)
         
         # 添加块头
         results.append({
@@ -266,136 +180,57 @@ class PcapAnalyzerWorker(QObject):
             "content": f"\n{'='*60}\n【数据块 {chunk_id}/{total_chunks}】\n包含 {len(chunk_packets)} 个数据包\n{'='*60}\n"
         })
         
-        # 对该块的数据包进行标准分析
+        # 对该块的数据包进行完整JSON导出
         try:
-            # 1. 查找flag（正则匹配）
+            decompiler = PacketDecompiler()
+            
+            # 导出所有包的完整JSON信息
+            packets_json = []
             for packet in chunk_packets:
                 try:
-                    src_ip = getattr(packet.ip, 'src', 'N/A') if hasattr(packet, 'ip') else 'N/A'
-                    dst_ip = getattr(packet.ip, 'dst', 'N/A') if hasattr(packet, 'ip') else 'N/A'
-                    
-                    # 收集所有可能包含数据的内容
-                    packet_contents = []
-                    
-                    if hasattr(packet, 'tcp') and hasattr(packet.tcp, 'payload'):
-                        packet_contents.append(str(getattr(packet.tcp, 'payload', '')))
-                    elif hasattr(packet, 'udp') and hasattr(packet.udp, 'payload'):
-                        packet_contents.append(str(getattr(packet.udp, 'payload', '')))
-                    
-                    if hasattr(packet, 'http'):
-                        if hasattr(packet.http, 'file_data'):
-                            packet_contents.append(str(getattr(packet.http, 'file_data', '')))
-                        if hasattr(packet.http, 'request_uri'):
-                            packet_contents.append(str(getattr(packet.http, 'request_uri', '')))
-                    
-                    if hasattr(packet, 'data'):
-                        packet_contents.append(str(getattr(packet.data, 'data', '')))
-                    
-                    # 正则匹配
-                    flag_patterns = [
-                        r'flag\{[^}]+\}',
-                        r'FLAG\{[^}]+\}',
-                        r'ctf\{[^}]+\}',
-                        r'CTF\{[^}]+\}',
-                        r'[A-Za-z0-9_]{20,}',
-                        r'[a-f0-9]{32}',
-                        r'[a-f0-9]{40}',
-                        r'[a-f0-9]{64}',
-                    ]
-                    
-                    for content in packet_contents:
-                        for pattern in flag_patterns:
-                            matches = re.findall(pattern, content, re.IGNORECASE)
-                            for match in matches:
-                                decoded_match = match
-                                try:
-                                    if all(c in '0123456789abcdefABCDEF' for c in match.replace(':', '')):
-                                        decoded_match = bytes.fromhex(match.replace(':', '')).decode('utf-8', errors='ignore')
-                                except:
-                                    pass
-                                
-                                results.append({
-                                    "type": "FLAG_REGEX_MATCH",
-                                    "src": src_ip,
-                                    "dst": dst_ip,
-                                    "match": decoded_match,
-                                    "content": f"Frame {packet.frame_info.number}: 正则匹配到可能的flag: {decoded_match}"
-                                })
-                except:
-                    continue
+                    # 完整解包
+                    decompiled = decompiler.decompile_packet(packet)
+                    packets_json.append(decompiled)
+                except Exception as e:
+                    print(f"解包数据包失败: {e}")
+                    # 即使解包失败，也添加基础信息
+                    packets_json.append({
+                        "packet_id": str(packet.frame_info.number),
+                        "timestamp": str(packet.frame_info.time),
+                        "packet_length": int(packet.frame_info.len),
+                        "protocols": packet.frame_info.protocols.split(':'),
+                        "error": str(e)
+                    })
             
-            # 2. 提取十六进制dump（完整的包数据）
-            for i, packet in enumerate(chunk_packets):
-                try:
-                    src_ip = getattr(packet.ip, 'src', 'N/A') if hasattr(packet, 'ip') else 'N/A'
-                    dst_ip = getattr(packet.ip, 'dst', 'N/A') if hasattr(packet, 'ip') else 'N/A'
-                    src_port = 'N/A'
-                    dst_port = 'N/A'
-                    
-                    if hasattr(packet, 'tcp'):
-                        src_port = getattr(packet.tcp, 'srcport', 'N/A')
-                        dst_port = getattr(packet.tcp, 'dstport', 'N/A')
-                    elif hasattr(packet, 'udp'):
-                        src_port = getattr(packet.udp, 'srcport', 'N/A')
-                        dst_port = getattr(packet.udp, 'dstport', 'N/A')
-                    
-                    # 获取十六进制数据（限制大小）
-                    hex_data = ""
-                    try:
-                        raw_packet = packet.get_raw_packet().hex()
-                        hex_data = ' '.join([raw_packet[i:i+2] for i in range(0, min(len(raw_packet), 400), 2)])
-                    except:
-                        pass
-                    
-                    if hex_data:
-                        results.append({
-                            "type": "HEX_DUMP",
-                            "src": f"{src_ip}:{src_port}",
-                            "dst": f"{dst_ip}:{dst_port}",
-                            "content": f"Frame {packet.frame_info.number} ({packet.frame_info.len} bytes): {hex_data}{'...' if len(raw_packet) > 400 else ''}"
-                        })
-                except:
-                    continue
-            
-            # 3. 提取全部数据
-            for packet in chunk_packets:
-                try:
-                    src_ip = getattr(packet.ip, 'src', 'N/A') if hasattr(packet, 'ip') else 'N/A'
-                    dst_ip = getattr(packet.ip, 'dst', 'N/A') if hasattr(packet, 'ip') else 'N/A'
-                    
-                    data_content = 'N/A'
-                    if hasattr(packet, 'data'):
-                        data_content = getattr(packet.data, 'data', 'N/A')
-                    elif hasattr(packet, 'tcp') and hasattr(packet.tcp, 'payload'):
-                        data_content = getattr(packet.tcp, 'payload', 'N/A')
-                    elif hasattr(packet, 'http') and hasattr(packet.http, 'file_data'):
-                        data_content = getattr(packet.http, 'file_data', 'N/A')
-                    
-                    if data_content != 'N/A':
-                        decoded_data = data_content
-                        try:
-                            if isinstance(data_content, str) and all(c in '0123456789abcdefABCDEF' for c in data_content.replace(':', '')):
-                                decoded_data = bytes.fromhex(data_content.replace(':', '')).decode('utf-8', errors='ignore')
-                        except:
-                            pass
-                        
-                        results.append({
-                            "type": "ALL_DATA",
-                            "src": src_ip,
-                            "dst": dst_ip,
-                            "content": f"Frame {packet.frame_info.number}: {decoded_data[:200]}{'...' if len(decoded_data) > 200 else ''}"
-                        })
-                except:
-                    continue
+            # 添加JSON导出结果 - 保存到文件而不是内存
+            if packets_json:
+                json_content = json.dumps(packets_json, ensure_ascii=False, indent=2)
+                
+                # 保存JSON到tmp文件
+                json_filename = f"chunk_{chunk_id:03d}.json"
+                json_filepath = tmp_dir / json_filename
+                with open(json_filepath, 'w', encoding='utf-8') as f:
+                    f.write(json_content)
+                
+                results.append({
+                    "type": "PACKETS_JSON",
+                    "chunk_id": chunk_id,
+                    "packet_count": len(packets_json),
+                    "json_file": str(json_filepath),  # 文件路径而不是内容
+                    "content": f"[JSON数据已保存到文件: {json_filepath}]",  # 简化内容，避免大数据
+                    "packets_data": packets_json  # 仅在本地使用
+                })
+                
+                print(f"[块{chunk_id}] 导出 {len(packets_json)} 个数据包的完整JSON到 {json_filepath}")
         
         except Exception as e:
-            print(f"分析块 {chunk_id} 时出错: {str(e)}")
+            print(f"JSON导出失败: {e}")
         
         # 添加块尾
         results.append({
             "type": "CHUNK_SUMMARY",
             "chunk_id": chunk_id,
-            "content": f"【块 {chunk_id} 分析完成】 提取 {len([r for r in results if r['type'] in ['FLAG_REGEX_MATCH', 'HEX_DUMP', 'ALL_DATA']])} 条记录\n"
+            "content": f"【块 {chunk_id} 分析完成】 导出 {len(chunk_packets)} 个数据包的完整JSON\n"
         })
         
         return results
@@ -956,3 +791,386 @@ class PcapAnalyzer(QObject):
         self.analysis_error.emit(error_msg)
         if self.worker:
             self.worker.deleteLater()
+
+
+class PacketDecompiler:
+    """数据包完整解包器 - 提供深层次的包分析和解包"""
+    
+    def __init__(self):
+        self.packet_data = {}
+    
+    def decompile_packet(self, packet):
+        """
+        完整解包一个数据包，提取所有层级的信息
+        """
+        result = {
+            "packet_id": str(packet.frame_info.number),
+            "timestamp": str(packet.frame_info.time),
+            "packet_length": int(packet.frame_info.len),
+            "protocols": packet.frame_info.protocols.split(':'),
+            "layers": {}
+        }
+        
+        # 逐层解析
+        for layer in packet.layers:
+            layer_name = layer.layer_name
+            layer_info = self._parse_layer(layer, layer_name)
+            result["layers"][layer_name] = layer_info
+        
+        # 获取完整的原始数据
+        result["raw_hex"] = self._get_full_hex_dump(packet)
+        result["payload"] = self._extract_full_payload(packet)
+        
+        return result
+    
+    def _parse_layer(self, layer, layer_name):
+        """解析单个协议层的所有字段"""
+        layer_data = {
+            "name": layer_name,
+            "fields": {}
+        }
+        
+        # 使用不同的方法根据协议类型
+        if layer_name == "IP" or layer_name == "IPv4":
+            layer_data["fields"] = self._parse_ip_layer(layer)
+        elif layer_name == "TCP":
+            layer_data["fields"] = self._parse_tcp_layer(layer)
+        elif layer_name == "UDP":
+            layer_data["fields"] = self._parse_udp_layer(layer)
+        elif layer_name == "HTTP":
+            layer_data["fields"] = self._parse_http_layer(layer)
+        elif layer_name == "DNS":
+            layer_data["fields"] = self._parse_dns_layer(layer)
+        elif layer_name == "ARP":
+            layer_data["fields"] = self._parse_arp_layer(layer)
+        elif layer_name == "ICMP" or layer_name == "ICMPv6":
+            layer_data["fields"] = self._parse_icmp_layer(layer)
+        else:
+            # 通用解析方式
+            layer_data["fields"] = self._parse_generic_layer(layer)
+        
+        return layer_data
+    
+    def _parse_ip_layer(self, layer):
+        """解析IP层"""
+        return {
+            "version": str(getattr(layer, 'version', 'N/A')),
+            "header_length": str(getattr(layer, 'hdr_len', 'N/A')),
+            "dscp": str(getattr(layer, 'dscp', 'N/A')),
+            "total_length": str(getattr(layer, 'len', 'N/A')),
+            "identification": str(getattr(layer, 'id', 'N/A')),
+            "flags": str(getattr(layer, 'flags', 'N/A')),
+            "fragment_offset": str(getattr(layer, 'frag_offset', 'N/A')),
+            "ttl": str(getattr(layer, 'ttl', 'N/A')),
+            "protocol": str(getattr(layer, 'proto', 'N/A')),
+            "checksum": str(getattr(layer, 'checksum', 'N/A')),
+            "src_ip": str(getattr(layer, 'src', 'N/A')),
+            "dst_ip": str(getattr(layer, 'dst', 'N/A')),
+        }
+    
+    def _parse_tcp_layer(self, layer):
+        """解析TCP层"""
+        return {
+            "src_port": str(getattr(layer, 'srcport', 'N/A')),
+            "dst_port": str(getattr(layer, 'dstport', 'N/A')),
+            "sequence_number": str(getattr(layer, 'seq', 'N/A')),
+            "acknowledgment_number": str(getattr(layer, 'ack', 'N/A')),
+            "header_length": str(getattr(layer, 'hdr_len', 'N/A')),
+            "flags": str(getattr(layer, 'flags', 'N/A')),
+            "window_size": str(getattr(layer, 'window_size', 'N/A')),
+            "checksum": str(getattr(layer, 'checksum', 'N/A')),
+            "urgent_pointer": str(getattr(layer, 'urgent_pointer', 'N/A')),
+            "options": self._parse_tcp_options(layer),
+            "payload_size": str(getattr(layer, 'len', 'N/A')),
+        }
+    
+    def _parse_tcp_options(self, layer):
+        """解析TCP选项"""
+        options = {}
+        try:
+            # 获取所有TCP选项
+            if hasattr(layer, 'option_mss'):
+                options['MSS'] = str(getattr(layer, 'option_mss', 'N/A'))
+            if hasattr(layer, 'option_wscale'):
+                options['WSCALE'] = str(getattr(layer, 'option_wscale', 'N/A'))
+            if hasattr(layer, 'option_sack_perm'):
+                options['SACK_PERM'] = 'present'
+            if hasattr(layer, 'option_timestamps'):
+                options['TIMESTAMPS'] = str(getattr(layer, 'option_timestamps', 'N/A'))
+        except:
+            pass
+        return options
+    
+    def _parse_udp_layer(self, layer):
+        """解析UDP层"""
+        return {
+            "src_port": str(getattr(layer, 'srcport', 'N/A')),
+            "dst_port": str(getattr(layer, 'dstport', 'N/A')),
+            "length": str(getattr(layer, 'len', 'N/A')),
+            "checksum": str(getattr(layer, 'checksum', 'N/A')),
+        }
+    
+    def _parse_http_layer(self, layer):
+        """解析HTTP层"""
+        http_data = {}
+        
+        # 请求行
+        if hasattr(layer, 'request_method'):
+            http_data['method'] = str(getattr(layer, 'request_method', 'N/A'))
+        if hasattr(layer, 'request_uri'):
+            http_data['uri'] = str(getattr(layer, 'request_uri', 'N/A'))
+        if hasattr(layer, 'request_version'):
+            http_data['version'] = str(getattr(layer, 'request_version', 'N/A'))
+        
+        # 响应行
+        if hasattr(layer, 'response_code'):
+            http_data['status_code'] = str(getattr(layer, 'response_code', 'N/A'))
+        if hasattr(layer, 'response_phrase'):
+            http_data['reason'] = str(getattr(layer, 'response_phrase', 'N/A'))
+        
+        # 请求头
+        headers = {}
+        for attr in dir(layer):
+            if 'request_' in attr and 'header' in attr.lower():
+                try:
+                    value = getattr(layer, attr)
+                    header_name = attr.replace('request_', '').replace('_', '-').upper()
+                    headers[header_name] = str(value)
+                except:
+                    pass
+        
+        if headers:
+            http_data['headers'] = headers
+        
+        # 请求体
+        if hasattr(layer, 'file_data'):
+            http_data['body'] = str(getattr(layer, 'file_data', 'N/A'))[:500]  # 限制大小
+        
+        return http_data
+    
+    def _parse_dns_layer(self, layer):
+        """解析DNS层"""
+        dns_data = {
+            "transaction_id": str(getattr(layer, 'id', 'N/A')),
+            "flags": str(getattr(layer, 'flags', 'N/A')),
+            "questions": [],
+            "answers": [],
+            "authorities": [],
+            "additionals": []
+        }
+        
+        try:
+            # 解析问题部分
+            if hasattr(layer, 'qry_name'):
+                dns_data['questions'].append({
+                    'name': str(getattr(layer, 'qry_name', 'N/A')),
+                    'type': str(getattr(layer, 'qry_type', 'N/A')),
+                    'class': str(getattr(layer, 'qry_class', 'N/A'))
+                })
+            
+            # 解析回答部分
+            if hasattr(layer, 'resp_name'):
+                dns_data['answers'].append({
+                    'name': str(getattr(layer, 'resp_name', 'N/A')),
+                    'type': str(getattr(layer, 'resp_type', 'N/A')),
+                    'class': str(getattr(layer, 'resp_class', 'N/A')),
+                    'ttl': str(getattr(layer, 'resp_ttl', 'N/A')),
+                    'data': str(getattr(layer, 'resp_addr', 'N/A'))
+                })
+        except:
+            pass
+        
+        return dns_data
+    
+    def _parse_arp_layer(self, layer):
+        """解析ARP层"""
+        return {
+            "hardware_type": str(getattr(layer, 'hw_type', 'N/A')),
+            "protocol_type": str(getattr(layer, 'proto_type', 'N/A')),
+            "operation": str(getattr(layer, 'opcode', 'N/A')),
+            "src_hw_addr": str(getattr(layer, 'src_hw_addr', 'N/A')),
+            "src_proto_addr": str(getattr(layer, 'src_proto_addr', 'N/A')),
+            "dst_hw_addr": str(getattr(layer, 'dst_hw_addr', 'N/A')),
+            "dst_proto_addr": str(getattr(layer, 'dst_proto_addr', 'N/A')),
+        }
+    
+    def _parse_icmp_layer(self, layer):
+        """解析ICMP层"""
+        return {
+            "type": str(getattr(layer, 'type', 'N/A')),
+            "code": str(getattr(layer, 'code', 'N/A')),
+            "checksum": str(getattr(layer, 'checksum', 'N/A')),
+            "rest_of_header": str(getattr(layer, 'rest_of_header', 'N/A')),
+        }
+    
+    def _parse_generic_layer(self, layer):
+        """通用层解析 - 适用于所有其他协议"""
+        fields = {}
+        
+        try:
+            # 获取层的所有非私有属性
+            for attr in dir(layer):
+                if not attr.startswith('_'):
+                    try:
+                        value = getattr(layer, attr)
+                        # 只保留基本类型的值
+                        if isinstance(value, (str, int, float, bool)):
+                            fields[attr] = str(value)
+                    except:
+                        pass
+        except:
+            pass
+        
+        return fields
+    
+    def _get_full_hex_dump(self, packet, bytes_per_line=16):
+        """获取完整的十六进制转储（所有原始数据）"""
+        try:
+            raw_data = bytes.fromhex(packet.get_raw_packet().hex())
+            hex_lines = []
+            
+            for i in range(0, len(raw_data), bytes_per_line):
+                chunk = raw_data[i:i+bytes_per_line]
+                hex_part = ' '.join(f'{b:02x}' for b in chunk)
+                ascii_part = ''.join(chr(b) if 32 <= b < 127 else '.' for b in chunk)
+                hex_lines.append(f"{i:08x}:  {hex_part:<{bytes_per_line*3}}  {ascii_part}")
+            
+            return '\n'.join(hex_lines)
+        except:
+            return ""
+    
+    def _extract_full_payload(self, packet):
+        """提取完整的payload数据"""
+        payload_info = {
+            "layers_with_payload": [],
+            "total_payload_size": 0
+        }
+        
+        try:
+            # 检查TCP payload
+            if hasattr(packet, 'tcp'):
+                if hasattr(packet.tcp, 'payload'):
+                    payload_hex = str(getattr(packet.tcp, 'payload', ''))
+                    payload_info["layers_with_payload"].append({
+                        "layer": "TCP",
+                        "size": len(payload_hex) // 2,
+                        "hex": payload_hex[:200],  # 前100字节
+                        "ascii": self._hex_to_ascii(payload_hex[:200])
+                    })
+                    payload_info["total_payload_size"] += len(payload_hex) // 2
+            
+            # 检查UDP payload
+            if hasattr(packet, 'udp'):
+                if hasattr(packet.udp, 'payload'):
+                    payload_hex = str(getattr(packet.udp, 'payload', ''))
+                    payload_info["layers_with_payload"].append({
+                        "layer": "UDP",
+                        "size": len(payload_hex) // 2,
+                        "hex": payload_hex[:200],
+                        "ascii": self._hex_to_ascii(payload_hex[:200])
+                    })
+                    payload_info["total_payload_size"] += len(payload_hex) // 2
+            
+            # 检查HTTP payload
+            if hasattr(packet, 'http'):
+                if hasattr(packet.http, 'file_data'):
+                    payload_hex = str(getattr(packet.http, 'file_data', ''))
+                    payload_info["layers_with_payload"].append({
+                        "layer": "HTTP",
+                        "size": len(payload_hex) // 2,
+                        "hex": payload_hex[:200],
+                        "ascii": self._hex_to_ascii(payload_hex[:200])
+                    })
+                    payload_info["total_payload_size"] += len(payload_hex) // 2
+            
+            # 检查通用data层
+            if hasattr(packet, 'data'):
+                payload_hex = str(getattr(packet.data, 'data', ''))
+                payload_info["layers_with_payload"].append({
+                    "layer": "DATA",
+                    "size": len(payload_hex) // 2,
+                    "hex": payload_hex[:200],
+                    "ascii": self._hex_to_ascii(payload_hex[:200])
+                })
+                payload_info["total_payload_size"] += len(payload_hex) // 2
+        
+        except Exception as e:
+            print(f"提取payload失败: {e}")
+        
+        return payload_info
+    
+    def _hex_to_ascii(self, hex_str):
+        """将十六进制字符串转换为ASCII"""
+        try:
+            data = bytes.fromhex(hex_str.replace(' ', '').replace(':', ''))
+            return ''.join(chr(b) if 32 <= b < 127 else '.' for b in data)
+        except:
+            return ""
+    
+    def decompile_packets_bulk(self, packets, max_packets=None):
+        """
+        批量解包
+        
+        Args:
+            packets: 数据包列表
+            max_packets: 最多解包数量（None表示全部）
+        """
+        results = []
+        
+        for i, packet in enumerate(packets):
+            if max_packets and i >= max_packets:
+                break
+            
+            try:
+                result = self.decompile_packet(packet)
+                results.append(result)
+            except Exception as e:
+                print(f"解包数据包失败: {e}")
+                continue
+        
+        return results
+    
+    def format_for_ai_analysis(self, decompiled_packets):
+        """
+        将解包结果格式化为AI分析用的文本格式
+        """
+        formatted = []
+        
+        for packet_data in decompiled_packets:
+            text = f"""
+【数据包 #{packet_data['packet_id']}】
+时间: {packet_data['timestamp']}
+长度: {packet_data['packet_length']} 字节
+协议栈: {' → '.join(packet_data['protocols'])}
+
+【协议层详解】
+"""
+            
+            # 添加各层详细信息
+            for layer_name, layer_info in packet_data['layers'].items():
+                text += f"\n{layer_name}层:\n"
+                for field, value in layer_info['fields'].items():
+                    text += f"  {field}: {value}\n"
+            
+            # 添加十六进制转储（前512字节）
+            if packet_data.get('raw_hex'):
+                hex_lines = packet_data['raw_hex'].split('\n')[:32]  # 前32行
+                text += f"\n【十六进制转储】(前{len(hex_lines)*16}字节):\n"
+                text += '\n'.join(hex_lines[:10]) + "\n"
+                if len(hex_lines) > 10:
+                    text += f"... 还有 {len(hex_lines) - 10} 行 ...\n"
+            
+            # 添加payload信息
+            if packet_data.get('payload', {}).get('layers_with_payload'):
+                text += f"\n【Payload信息】\n"
+                text += f"总大小: {packet_data['payload']['total_payload_size']} 字节\n"
+                for payload in packet_data['payload']['layers_with_payload']:
+                    text += f"  {payload['layer']}: {payload['size']} 字节\n"
+                    if payload['hex']:
+                        text += f"    Hex: {payload['hex']}\n"
+                        text += f"    ASCII: {payload['ascii']}\n"
+            
+            text += "\n" + "="*60 + "\n"
+            formatted.append(text)
+        
+        return '\n'.join(formatted)

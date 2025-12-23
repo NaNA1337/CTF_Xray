@@ -372,6 +372,9 @@ class CTFXRayMainWindow(QMainWindow):
             else:
                 clean_results.append(result)
         
+        # 保存分析结果（包括json_file路径）- 用于AI分析
+        self.network_analysis_results = results
+        
         # 保存分析过程
         self.network_analysis_process = analysis_process
         
@@ -397,29 +400,24 @@ class CTFXRayMainWindow(QMainWindow):
         
     def network_ai_analyze(self):
         """使用AI对网络流量进行深度分析"""
-        # 获取当前表格中的所有数据
-        if self.network_results.rowCount() > 0:
-            # 收集所有网络分析结果作为AI分析的数据源
-            network_data = []
-            for row in range(self.network_results.rowCount()):
-                data_item = {
-                    "type": self.network_results.item(row, 0).text() if self.network_results.item(row, 0) else "",
-                    "src": self.network_results.item(row, 1).text() if self.network_results.item(row, 1) else "",
-                    "dst": self.network_results.item(row, 2).text() if self.network_results.item(row, 2) else "",
-                    "content": self.network_results.item(row, 3).text() if self.network_results.item(row, 3) else ""
-                }
-                network_data.append(data_item)
-            
+        # 使用保存的原始分析结果（包含json_file路径）
+        if hasattr(self, 'network_analysis_results') and self.network_analysis_results:
             # 切换到AI标签页
             self.tabs.setCurrentWidget(self.ai_tab)
             
-            # 设置AI分析的数据
-            self.raw_data_display.setPlainText(json.dumps(network_data, indent=2, ensure_ascii=False))
+            # 显示分析数据源
+            ai_data = {
+                "source": "PCAP Network Analysis",
+                "result_count": len(self.network_analysis_results),
+                "has_json_files": any(r.get('json_file') for r in self.network_analysis_results),
+                "json_files": [r.get('json_file') for r in self.network_analysis_results if r.get('json_file')]
+            }
+            self.raw_data_display.setPlainText(f"网络流量分析结果已加载:\n{json.dumps(ai_data, indent=2, ensure_ascii=False)}")
             
             # 自动填充用户提示
-            self.user_prompt_input.setPlainText("请对提供的网络流量数据进行全面分析，包括：\n1. 流量概览和整体通信模式\n2. 流量模式识别\n3. 异常通信行为检测\n4. 协议分析\n5. 数据泄露风险评估\n6. 可能的攻击向量分析\n7. Flag定位")
+            self.user_prompt_input.setPlainText("请对提供的PCAP网络流量数据进行全面分析，识别所有可疑的flag、hash值、异常流量特征")
             
-            self.statusBar().showMessage("已将网络流量数据加载到AI分析模块，请点击'询问AI'进行深度分析")
+            self.statusBar().showMessage(f"已加载{len(self.network_analysis_results)}条分析结果，包含{len([r.get('json_file') for r in self.network_analysis_results if r.get('json_file')])}个JSON文件，请点击'询问AI'进行深度分析")
         else:
             QMessageBox.warning(self, "警告", "没有可供分析的网络流量数据，请先执行流量分析")
 
@@ -582,21 +580,29 @@ class CTFXRayMainWindow(QMainWindow):
     def ask_ai(self):
         """询问AI"""
         user_prompt = self.user_prompt_input.toPlainText()
-        # 准备当前选中的数据作为上下文
-        current_data = {
-            "type": "USER_SELECTED",
-            "content": self.raw_data_display.toPlainText()
-        }
+        
+        # 优先使用网络分析结果（如果存在）
+        if hasattr(self, 'network_analysis_results') and self.network_analysis_results:
+            # 直接传递原始分析结果给AI协调器
+            analysis_data = self.network_analysis_results
+            print(f"[AI分析] 使用网络分析结果 ({len(analysis_data)} 条记录)")
+        else:
+            # 降级：从表格读取
+            current_data = {
+                "type": "USER_SELECTED",
+                "content": self.raw_data_display.toPlainText()
+            }
+            analysis_data = [current_data]
         
         # 获取API设置
         api_key = self.api_key_input.text()
         model = self.model_input.text()
         
-        if user_prompt or current_data["content"]:
+        if user_prompt or analysis_data:
             self.statusBar().showMessage("正在向AI发送请求...")
             self.ask_ai_btn.setEnabled(False)
-            # 传递对话历史给AI分析
-            self.ai_coordinator.analyze([current_data], user_prompt, api_key, model, 
+            # 传递原始分析结果给AI分析（包含json_file路径）
+            self.ai_coordinator.analyze(analysis_data, user_prompt, api_key, model, 
                                        conversation_history=self.conversation_history)
         else:
             QMessageBox.warning(self, "警告", "请输入提示内容或选择数据")

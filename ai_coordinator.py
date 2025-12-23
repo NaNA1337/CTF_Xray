@@ -71,8 +71,177 @@ class AICoordinatorWorker(QObject):
             self.error.emit(str(e))
     
     def process_chunked_data(self):
-        """处理分块数据的AI分析"""
-        print("[分块处理] 开始处理分块数据...")
+        """处理分块数据 - 逐个JSON文件发送给AI
+        
+        策略：
+        1. 从 tmp 文件夹读取所有 chunk_*.json 文件
+        2. 逐个文件读取并发送给AI（避免上下文超限）
+        3. 收集所有块的分析结果
+        4. 最后执行综合分析
+        """
+        from pathlib import Path
+        import json as json_lib
+        
+        print("[分块处理] 开始逐块处理分块数据...")
+        
+        # 1. 从 tmp 文件夹读取所有JSON文件
+        tmp_dir = Path("tmp")
+        json_files = sorted(tmp_dir.glob("chunk_*.json")) if tmp_dir.exists() else []
+        
+        if not json_files:
+            print("[分块处理] 未找到tmp/chunk_*.json文件，使用降级模式...")
+            return self._process_chunked_data_legacy()
+        
+        print(f"[分块处理] 找到 {len(json_files)} 个JSON块文件")
+        
+        all_flags = []
+        block_results = []
+        
+        # 2. 逐个文件处理（不合并）
+        for block_id, json_file in enumerate(json_files, 1):
+            print(f"\n[块分析 {block_id}/{len(json_files)}] 处理文件: {json_file.name}...")
+            
+            try:
+                # 读取JSON文件
+                with open(json_file, 'r', encoding='utf-8') as f:
+                    chunk_data = json_lib.load(f)
+                
+                if not isinstance(chunk_data, list):
+                    chunk_data = [chunk_data]
+                
+                packet_count = len(chunk_data)
+                print(f"  ✓ 读取成功: {packet_count} 个数据包")
+                
+                # 3. 为这个块构造prompt
+                block_prompt = f"【数据块 {block_id}/{len(json_files)}】\n"
+                block_prompt += f"文件: {json_file.name}\n"
+                block_prompt += f"数据包数: {packet_count}\n\n"
+                
+                # 直接嵌入完整JSON数据
+                block_prompt += "【完整数据包JSON数据】\n\n"
+                block_prompt += json_lib.dumps(chunk_data, ensure_ascii=False, indent=2)
+                
+                block_prompt += f"""
+
+【分析任务】
+上述JSON包含来自PCAP的{packet_count}个完整网络数据包。请分析这些数据：
+
+1. **Flag识别**: 查找所有flag格式 (flag{{...}}, FLAG{{...}}, ctf{{...}}) 或可疑的hash值
+2. **HTTP流量**: 分析HTTP请求/响应中的：
+   - 异常参数和payload
+   - 文件上传内容（特别是flag.jpg等文件）
+   - 隐藏的编码数据（base64、hex等）
+   - Cookie和认证信息
+3. **DNS流量**: 查找异常域名和二级域名
+4. **加密流量**: SSL/TLS特征、证书信息
+5. **其他流量**: 未知协议、异常端口、隐藏通道
+
+【输出格式】
+直接列出发现的所有flag和可疑内容，格式如：
+- flag{{xxx}}
+- hash: xxxxx
+- 可疑数据: xxxxx
+"""
+                
+                # 4. 发送给AI分析
+                try:
+                    api_result = self.call_iflow_model(block_prompt)
+                    flags = self.extract_flags_from_result(api_result)
+                    all_flags.extend(flags)
+                    
+                    summary = api_result.get("raw_response", "")[:200]
+                    block_results.append({
+                        "block_id": block_id,
+                        "file": json_file.name,
+                        "packet_count": packet_count,
+                        "flags_found": len(flags),
+                        "summary": summary,
+                        "flags": flags
+                    })
+                    
+                    print(f"  ✓ 分析完成，发现 {len(flags)} 个flag")
+                    if flags:
+                        print(f"    → {', '.join(flags[:3])}")
+                    
+                except Exception as e:
+                    print(f"  ❌ 分析失败: {str(e)}")
+                    import traceback
+                    traceback.print_exc()
+                    continue
+            
+            except Exception as e:
+                print(f"  ❌ 读取文件失败: {str(e)}")
+                continue
+        
+        # 5. 最终综合分析
+        print(f"\n[最终分析] 执行综合分析 ({len(block_results)} 块已处理)...")
+        
+        unique_flags = list(set(all_flags))
+        synthesis_prompt = f"""
+【最终综合分析报告】
+
+已对所有 {len(json_files)} 个数据块进行逐块分析。
+
+分析统计：
+- 总块数: {len(json_files)}
+- 已处理块: {len(block_results)}
+- 发现的flag总数: {len(unique_flags)}
+
+各块发现汇总：
+"""
+        
+        for result in block_results:
+            synthesis_prompt += f"\n块{result['block_id']} ({result['file']}): "
+            synthesis_prompt += f"{result['packet_count']}个包, 发现{result['flags_found']}个flag"
+            if result['flags']:
+                synthesis_prompt += f" → {', '.join(result['flags'][:2])}"
+            synthesis_prompt += "\n"
+        
+        synthesis_prompt += f"\n\n所有发现的flag（共{len(unique_flags)}个，待去重）：\n"
+        for idx, flag in enumerate(unique_flags, 1):
+            synthesis_prompt += f"{idx}. {flag}\n"
+        
+        synthesis_prompt += f"""
+
+【最终任务】
+请给出最终确认的flag列表和分析总结：
+1. **确认的有效flag** - 去除重复和明显的误报，只保留符合flag格式的内容
+2. **flag来源** - 对每个flag说明发现于哪个块，来自什么类型的流量
+3. **流量特征总结** - 整个PCAP的总体特征和异常点
+4. **安全建议** - 根据流量分析给出的安全建议
+
+重点：优先确认 flag{{...}} 或 FLAG{{...}} 格式的内容，其他hash值作为次选
+"""
+        
+        try:
+            final_result = self.call_iflow_model(synthesis_prompt)
+            final_flags = self.extract_flags_from_result(final_result)
+            all_flags.extend(final_flags)
+            
+            unique_flags = list(set(all_flags))
+            
+            return {
+                "flags": unique_flags,
+                "raw_response": final_result.get("raw_response", ""),
+                "status": "success_sequential",
+                "total_chunks": len(json_files),
+                "processed_blocks": len(block_results),
+                "analysis": f"逐块分析完成（{len(json_files)}个文件，{len(block_results)}块已处理），共发现 {len(unique_flags)} 个flag"
+            }
+        except Exception as e:
+            print(f"[最终分析] 失败: {str(e)}")
+            return {
+                "flags": list(set(all_flags)),
+                "raw_response": "",
+                "status": "partial_success",
+                "total_chunks": len(json_files),
+                "processed_blocks": len(block_results),
+                "analysis": f"逐块分析部分完成（{len(block_results)}/{len(json_files)}块），共发现 {len(set(all_flags))} 个flag"
+            }
+    
+    def _process_chunked_data_legacy(self):
+        """原始分块数据处理（降级方案 - 当没有JSON文件时使用）"""
+        print("[分块处理] 使用原始分块处理模式...")
         
         # 将数据按块分组
         chunks = {}
@@ -88,11 +257,9 @@ class AICoordinatorWorker(QObject):
                 if chunk_id not in chunks:
                     chunks[chunk_id] = []
                     chunk_order.append(chunk_id)
-            elif item_type == 'CHUNK_COMPLETE':
+            elif item_type in ['CHUNK_COMPLETE', 'CHUNK_SUMMARY', 'ANALYSIS_PROCESS']:
                 continue  # 跳过标记
-            elif item_type == 'CHUNK_SUMMARY':
-                continue  # 跳过标记
-            elif item_type not in ['ANALYSIS_PROCESS']:
+            else:
                 # 该项属于最近的块
                 if chunk_order:
                     current_chunk = chunk_order[-1]
@@ -184,45 +351,84 @@ class AICoordinatorWorker(QObject):
                 prompt += f"- {summary}\n"
             prompt += "\n"
         
-        # 添加当前块的数据
-        prompt += "【当前块的原始数据】\n"
+        # 检查是否有完整的JSON数据包信息
+        json_packets = [item for item in chunk_items if item.get('type') == 'PACKETS_JSON']
         
-        # 按优先级显示数据
-        flag_matches = [item for item in chunk_items if item.get('type') == 'FLAG_REGEX_MATCH']
-        hex_dumps = [item for item in chunk_items if item.get('type') == 'HEX_DUMP']
-        all_data = [item for item in chunk_items if item.get('type') == 'ALL_DATA']
-        
-        # 显示flag匹配结果（最重要）
-        if flag_matches:
-            prompt += f"\n正则匹配到的可疑内容（{len(flag_matches)}条）:\n"
-            for item in flag_matches[:10]:  # 最多显示10条
-                prompt += f"- {item.get('match', '')}\n"
-        
-        # 显示十六进制数据
-        if hex_dumps:
-            prompt += f"\n十六进制数据包（{len(hex_dumps)}条）:\n"
-            for item in hex_dumps[:5]:  # 最多显示5条
-                prompt += f"- {item.get('content', '')}\n"
-        
-        # 显示其他数据
-        if all_data:
-            prompt += f"\n其他提取的数据（{len(all_data)}条）:\n"
-            for item in all_data[:5]:  # 最多显示5条
-                prompt += f"- {item.get('content', '')}\n"
+        if json_packets:
+            # 优先使用完整的JSON数据
+            prompt += "【完整数据包JSON数据】\n\n"
+            for item in json_packets:
+                # 直接添加JSON内容
+                json_content = item.get('content', '')
+                
+                # 限制JSON大小以避免超出token限制
+                if len(json_content) > 50000:
+                    # 如果太大，只取前50KB
+                    json_content = json_content[:50000] + "\n... [数据已截断] ...\n"
+                
+                prompt += json_content + "\n\n"
+        else:
+            # 降级方案：如果没有JSON数据，使用之前的数据
+            flag_matches = [item for item in chunk_items if item.get('type') == 'FLAG_REGEX_MATCH']
+            decompiled = [item for item in chunk_items if item.get('type') == 'PACKET_DECOMPILE']
+            hex_dumps = [item for item in chunk_items if item.get('type') == 'HEX_DUMP']
+            all_data = [item for item in chunk_items if item.get('type') == 'ALL_DATA']
+            
+            # 显示flag匹配结果（最重要）
+            if flag_matches:
+                prompt += f"\n【正则匹配的可疑内容】({len(flag_matches)}条):\n"
+                for item in flag_matches[:10]:  # 最多显示10条
+                    prompt += f"- {item.get('match', '')}\n"
+            
+            # 显示完整的包解包信息
+            if decompiled:
+                prompt += f"\n【完整数据包解包分析】({len(decompiled)}个包):\n"
+                for item in decompiled[:3]:  # 最多显示3个包的详细信息
+                    decomp_data = item.get('decompiled', {})
+                    packet_id = decomp_data.get('packet_id', '?')
+                    protocols = ' → '.join(decomp_data.get('protocols', []))
+                    
+                    prompt += f"\n包#{packet_id} [{protocols}]:\n"
+                    
+                    # 添加各层详细信息
+                    for layer_name, layer_info in decomp_data.get('layers', {}).items():
+                        fields = layer_info.get('fields', {})
+                        if fields:
+                            prompt += f"  {layer_name}层:\n"
+                            for field, value in list(fields.items())[:5]:  # 每层最多5个字段
+                                prompt += f"    {field}: {value}\n"
+                    
+                    # 添加十六进制转储预览
+                    if decomp_data.get('raw_hex'):
+                        hex_preview = '\n'.join(decomp_data['raw_hex'].split('\n')[:3])  # 前3行
+                        prompt += f"  十六进制转储:\n{hex_preview}...\n"
+            
+            # 显示十六进制数据
+            if hex_dumps and not decompiled:  # 如果没有完整解包，才显示hex dump
+                prompt += f"\n【十六进制数据包】({len(hex_dumps)}条):\n"
+                for item in hex_dumps[:5]:  # 最多显示5条
+                    prompt += f"- {item.get('content', '')}\n"
+            
+            # 显示其他数据
+            if all_data:
+                prompt += f"\n【其他提取的数据】({len(all_data)}条):\n"
+                for item in all_data[:5]:  # 最多显示5条
+                    prompt += f"- {item.get('content', '')}\n"
         
         # 添加分析任务
         prompt += f"\n【分析任务】\n"
         prompt += f"请分析这一块的数据，查找：\n"
         prompt += f"1. 所有的flag格式内容 (flag{{}}, FLAG{{}}, ctf{{}}, 等)\n"
         prompt += f"2. 可疑的哈希值或加密文本\n"
-        prompt += f"3. 特殊的协议行为或数据流特征\n"
-        prompt += f"4. 任何看起来异常的内容\n\n"
+        prompt += f"3. 特殊的协议字段和流量特征\n"
+        prompt += f"4. 任何看起来异常或隐藏的内容\n\n"
         
         if self.user_prompt:
             prompt += f"【用户要求】\n{self.user_prompt}\n"
         
         return prompt
-
+    
+    def process_in_batches(self):
         """分批处理大数据包"""
         # 按每个批次最多30KB计算分批数量
         batch_size = 30000
