@@ -353,10 +353,31 @@ class CTFXRayMainWindow(QMainWindow):
     def start_capture(self):
         """开始实时抓包"""
         QMessageBox.information(self, "提示", "实时抓包功能将在后续版本中实现")
+    
+    def _cleanup_analysis_data(self):
+        """清理旧的分析数据：删除tmp文件夹和对话历史"""
+        from pathlib import Path
+        import shutil
+        
+        # 删除tmp文件夹及其内容
+        tmp_dir = Path("tmp")
+        if tmp_dir.exists():
+            try:
+                shutil.rmtree(tmp_dir)
+                print("[清理] 已删除tmp文件夹及其内容")
+            except Exception as e:
+                print(f"[清理] 删除tmp文件夹失败: {e}")
+        
+        # 清空对话历史
+        self.conversation_history = []
+        print("[清理] 已清空对话历史")
         
     def analyze_network(self):
         """分析网络流量"""
         if hasattr(self, 'selected_pcap_file'):
+            # 清除旧的tmp文件夹和对话历史，避免数据冲突
+            self._cleanup_analysis_data()
+            
             self.statusBar().showMessage("正在分析网络流量...")
             self.network_analyze_btn.setEnabled(False)
             self.pcap_analyzer.analyze(self.selected_pcap_file)
@@ -402,6 +423,10 @@ class CTFXRayMainWindow(QMainWindow):
         """使用AI对网络流量进行深度分析"""
         # 使用保存的原始分析结果（包含json_file路径）
         if hasattr(self, 'network_analysis_results') and self.network_analysis_results:
+            # 清空AI对话框和对话历史，开始新的对话
+            self.ai_response_display.setPlainText("")
+            self.conversation_history = []
+            
             # 切换到AI标签页
             self.tabs.setCurrentWidget(self.ai_tab)
             
@@ -601,6 +626,8 @@ class CTFXRayMainWindow(QMainWindow):
         if user_prompt or analysis_data:
             self.statusBar().showMessage("正在向AI发送请求...")
             self.ask_ai_btn.setEnabled(False)
+            # 清空AI响应框（新的询问开始）
+            self.ai_response_display.setPlainText("")
             # 传递原始分析结果给AI分析（包含json_file路径）
             self.ai_coordinator.analyze(analysis_data, user_prompt, api_key, model, 
                                        conversation_history=self.conversation_history)
