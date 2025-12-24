@@ -18,6 +18,13 @@ import shutil
 from pathlib import Path
 
 
+def get_tcp_segment(pkt):
+    """从pyshark数据包中解码TCP十六进制payload为原始字节"""
+    if hasattr(pkt, "tcp") and hasattr(pkt.tcp, "payload"):
+        return bytes.fromhex(str(pkt.tcp.payload).replace(":", ""))
+    return b""
+
+
 class PcapAnalyzerWorker(QObject):
     """PCAP分析工作线程"""
     finished = Signal(list)  # 发送分析结果
@@ -111,42 +118,37 @@ class PcapAnalyzerWorker(QObject):
             self.analysis_process.append({"step": "环境检查", "details": f"pyshark库不可用或无法加载PCAP文件: {str(e)}"})
             raise Exception(f"无法加载PCAP文件: {str(e)}")
         
-        # 分块处理数据包
+        # 统一处理所有数据包，输出到单个JSON文件
         try:
-            # 分块处理
-            chunk_size = 50
             total_packets = len(packets)
-            total_chunks = (total_packets + chunk_size - 1) // chunk_size
+            self.analysis_process.append({"step": "数据包分析", "details": f"开始分析{total_packets}个数据包"})
+            print(f"[分析] 开始分析 {total_packets} 个数据包...")
             
-            self.analysis_process.append({"step": "分块分析", "details": f"总共{total_packets}个数据包，分为{total_chunks}块"})
-            print(f"[分块分析] 总共 {total_packets} 个数据包，分为 {total_chunks} 块")
+            # 分析所有数据包
+            all_packets_json = self._analyze_all_packets(packets)
             
-            # 逐块分析
-            for chunk_id in range(total_chunks):
-                start_idx = chunk_id * chunk_size
-                end_idx = min((chunk_id + 1) * chunk_size, total_packets)
-                chunk_packets = packets[start_idx:end_idx]
-                
-                print(f"[分块分析] 处理块 {chunk_id + 1}/{total_chunks} (包 #{start_idx + 1}-#{end_idx})")
-                
-                # 分析这一块
-                chunk_results = self._analyze_chunk(chunk_packets, chunk_id + 1, total_chunks)
-                results.extend(chunk_results)
-                
-                # 添加块完成的标记
-                results.append({
-                    "type": "CHUNK_COMPLETE",
-                    "chunk_id": chunk_id + 1,
-                    "total_chunks": total_chunks,
-                    "packet_range": f"#{start_idx + 1}-#{end_idx}",
-                    "content": f"块 {chunk_id + 1} 分析完成，处理 {end_idx - start_idx} 个数据包"
-                })
+            # 保存到单个JSON文件
+            tmp_dir = Path("tmp")
+            if not tmp_dir.exists():
+                tmp_dir.mkdir(exist_ok=True)
             
-            self.analysis_process.append({"step": "分块分析完成", "details": f"完成分块分析，共 {total_chunks} 块"})
+            json_filepath = tmp_dir / "all_packets.json"
+            with open(json_filepath, 'w', encoding='utf-8') as f:
+                json.dump(all_packets_json, f, indent=2, ensure_ascii=False)
+            
+            results.append({
+                "type": "PACKETS_JSON",
+                "packet_count": len(all_packets_json),
+                "json_file": str(json_filepath),
+                "content": f"[数据包分析完成，已保存到: {json_filepath}]"
+            })
+            
+            print(f"[分析] 共分析 {len(all_packets_json)} 个数据包，已保存到 {json_filepath}")
+            self.analysis_process.append({"step": "数据包分析完成", "details": f"已分析 {len(all_packets_json)} 个数据包，保存到JSON文件"})
         
         except Exception as e:
-            self.analysis_process.append({"step": "分块分析错误", "details": f"分块分析出错: {str(e)}"})
-            print(f"分块分析出错: {str(e)}")
+            self.analysis_process.append({"step": "分析错误", "details": f"数据包分析出错: {str(e)}"})
+            print(f"分析出错: {str(e)}")
             raise
         finally:
             try:
@@ -157,6 +159,39 @@ class PcapAnalyzerWorker(QObject):
         
         self.analysis_process.append({"step": "分析完成", "details": f"分析完成，共发现{len(results)}条记录"})
         return results
+    
+    def _analyze_all_packets(self, packets):
+        """
+        分析所有数据包，输出到单个JSON文件
+        对所有数据包进行完整解包和分析
+        """
+        decompiler = PacketDecompiler()
+        packets_json = []
+        
+        print(f"[分析] 开始解包 {len(packets)} 个数据包...")
+        
+        for idx, packet in enumerate(packets, 1):
+            try:
+                # 完整解包
+                decompiled = decompiler.decompile_packet(packet)
+                packets_json.append(decompiled)
+            except Exception as e:
+                print(f"[错误] 解包数据包 #{idx} 失败: {e}")
+                # 即使解包失败，也添加基础信息
+                packets_json.append({
+                    "packet_id": str(packet.frame_info.number),
+                    "timestamp": str(packet.frame_info.time),
+                    "packet_length": int(packet.frame_info.len),
+                    "protocols": packet.frame_info.protocols.split(':'),
+                    "error": str(e)
+                })
+            
+            # 每100个包输出一次进度
+            if idx % 100 == 0:
+                print(f"[进度] 已解包 {idx}/{len(packets)} 个数据包")
+        
+        print(f"[完成] 共解包 {len(packets_json)} 个数据包")
+        return packets_json
     
     def _analyze_chunk(self, chunk_packets, chunk_id, total_chunks):
         """
@@ -468,11 +503,13 @@ class PcapAnalyzerWorker(QObject):
                         decoded_payload = bytes.fromhex(decoded_payload.replace(':', '')).decode('utf-8', errors='ignore')
                 except:
                     pass
-                
+
                 # 构建内容信息
                 content_info = f"TCP流: {stream_data['src']} -> {stream_data['dst']}\n"
                 content_info += f"数据包数: {packet_count}\n"
-                content_info += f"完整Payload: {decoded_payload[:500]}\n" if decoded_payload else ""
+                if decoded_payload:
+                    decoded_text = self._decode_hex_to_text(decoded_payload, max_len=2000)
+                    content_info += f"完整Payload(Text): {decoded_text[:500]}\n"
                 content_info += f"应用层数据: {stream_data['all_app_data'][:500]}" if stream_data['all_app_data'] else ""
                 
                 # 详细的协议字段
@@ -488,7 +525,8 @@ class PcapAnalyzerWorker(QObject):
                     "content": content_info,
                     "protocol_details": "\n".join(protocol_details[:10]),  # 仅保留前10个数据包的详情
                     "packet_count": packet_count,
-                    "payload": decoded_payload[:1000]  # 提供更多的payload用于分析
+                    "payload": decoded_payload[:1000],  # 原始聚合payload
+                    "payload_text": decoded_text[:1000] if decoded_payload else ""  # 文本化payload
                 }
                 results.append(result_entry)
                 
@@ -808,19 +846,23 @@ class PacketDecompiler:
             "timestamp": str(packet.frame_info.time),
             "packet_length": int(packet.frame_info.len),
             "protocols": packet.frame_info.protocols.split(':'),
-            "layers": {}
+            "layers": {},
+            "readable_payloads": []
         }
-        
+
         # 逐层解析
         for layer in packet.layers:
             layer_name = layer.layer_name
             layer_info = self._parse_layer(layer, layer_name)
             result["layers"][layer_name] = layer_info
-        
+
         # 获取完整的原始数据
         result["raw_hex"] = self._get_full_hex_dump(packet)
+        result["raw_text_preview"] = self._get_raw_text_preview(packet)
         result["payload"] = self._extract_full_payload(packet)
-        
+        result["printable_strings"] = self._extract_printable_strings(packet)
+        result["readable_payloads"] = self._extract_readable_payloads(packet)
+
         return result
     
     def _parse_layer(self, layer, layer_name):
@@ -848,7 +890,11 @@ class PacketDecompiler:
         else:
             # 通用解析方式
             layer_data["fields"] = self._parse_generic_layer(layer)
-        
+
+        decoded_fields = self._decode_hex_fields(layer_data["fields"])
+        if decoded_fields:
+            layer_data["decoded_fields"] = decoded_fields
+
         return layer_data
     
     def _parse_ip_layer(self, layer):
@@ -1022,6 +1068,30 @@ class PacketDecompiler:
             pass
         
         return fields
+
+    def _decode_hex_fields(self, fields):
+        """尝试将字段中的十六进制字符串解码为可读文本"""
+        decoded = {}
+        if not isinstance(fields, dict):
+            return decoded
+
+        hex_chars = set("0123456789abcdefABCDEF")
+        for key, value in fields.items():
+            if not isinstance(value, str):
+                continue
+            cleaned = value.replace("0x", "").replace("0X", "").replace(":", "").replace(" ", "")
+            if len(cleaned) < 8 or len(cleaned) % 2 != 0:
+                continue
+            if any(c not in hex_chars for c in cleaned):
+                continue
+            text = self._decode_hex_to_text(cleaned, max_len=400)
+            if not text:
+                continue
+            visible = sum(1 for ch in text if ch.isalnum() or ch in " _-{}:;,.@/\\")
+            if visible >= 4:
+                decoded[key] = text
+
+        return decoded
     
     def _get_full_hex_dump(self, packet, bytes_per_line=16):
         """获取完整的十六进制转储（所有原始数据）"""
@@ -1038,7 +1108,65 @@ class PacketDecompiler:
             return '\n'.join(hex_lines)
         except:
             return ""
-    
+
+    def _get_raw_text_preview(self, packet, max_len=800):
+        """获取原始payload的可读文本预览（utf-8解码，回退为可打印字符）"""
+        try:
+            raw_data = packet.get_raw_packet() if hasattr(packet, "get_raw_packet") else b""
+            text = raw_data.decode('utf-8', errors='ignore')
+            text = self._to_printable_text(text)
+            if not text.strip():
+                text = ''.join(chr(b) if 32 <= b < 127 else '.' for b in raw_data)
+            return self._to_printable_text(text, max_len=max_len)
+        except:
+            pass
+
+        try:
+            tcp_bytes = self._get_tcp_segment(packet)
+            return self._decode_bytes_to_text(tcp_bytes, max_len=max_len)
+        except:
+            return ""
+
+    def _extract_printable_strings(self, packet, min_len=4, max_total_len=2000):
+        """提取类似Wireshark可见字符串的明文片段（仅可打印ASCII）"""
+        try:
+            raw_data = packet.get_raw_packet() if hasattr(packet, "get_raw_packet") else b""
+        except Exception:
+            raw_data = b""
+
+        try:
+            tcp_bytes = self._get_tcp_segment(packet)
+            if tcp_bytes:
+                raw_data = tcp_bytes
+        except Exception:
+            pass
+
+        if not raw_data:
+            return ""
+
+        parts = []
+        buf = []
+        total_len = 0
+        for b in raw_data:
+            if 32 <= b < 127:
+                buf.append(chr(b))
+            else:
+                if len(buf) >= min_len:
+                    segment = ''.join(buf)
+                    parts.append(segment)
+                    total_len += len(segment)
+                    if total_len >= max_total_len:
+                        break
+                buf = []
+
+        if buf and len(buf) >= min_len and total_len < max_total_len:
+            parts.append(''.join(buf))
+
+        text = "\n".join(parts)
+        if len(text) > max_total_len:
+            text = text[:max_total_len] + "...(truncated)"
+        return text
+
     def _extract_full_payload(self, packet):
         """提取完整的payload数据"""
         payload_info = {
@@ -1051,14 +1179,16 @@ class PacketDecompiler:
             if hasattr(packet, 'tcp'):
                 if hasattr(packet.tcp, 'payload'):
                     payload_hex = str(getattr(packet.tcp, 'payload', ''))
+                    tcp_bytes = self._get_tcp_segment(packet)
                     payload_info["layers_with_payload"].append({
                         "layer": "TCP",
                         "size": len(payload_hex) // 2,
                         "hex": payload_hex[:200],  # 前100字节
-                        "ascii": self._hex_to_ascii(payload_hex[:200])
+                        "ascii": self._hex_to_ascii(payload_hex[:200]),
+                        "text": self._decode_bytes_to_text(tcp_bytes)
                     })
                     payload_info["total_payload_size"] += len(payload_hex) // 2
-            
+
             # 检查UDP payload
             if hasattr(packet, 'udp'):
                 if hasattr(packet.udp, 'payload'):
@@ -1067,10 +1197,11 @@ class PacketDecompiler:
                         "layer": "UDP",
                         "size": len(payload_hex) // 2,
                         "hex": payload_hex[:200],
-                        "ascii": self._hex_to_ascii(payload_hex[:200])
+                        "ascii": self._hex_to_ascii(payload_hex[:200]),
+                        "text": self._decode_hex_to_text(payload_hex)
                     })
                     payload_info["total_payload_size"] += len(payload_hex) // 2
-            
+
             # 检查HTTP payload
             if hasattr(packet, 'http'):
                 if hasattr(packet.http, 'file_data'):
@@ -1079,10 +1210,11 @@ class PacketDecompiler:
                         "layer": "HTTP",
                         "size": len(payload_hex) // 2,
                         "hex": payload_hex[:200],
-                        "ascii": self._hex_to_ascii(payload_hex[:200])
+                        "ascii": self._hex_to_ascii(payload_hex[:200]),
+                        "text": self._decode_hex_to_text(payload_hex)
                     })
                     payload_info["total_payload_size"] += len(payload_hex) // 2
-            
+
             # 检查通用data层
             if hasattr(packet, 'data'):
                 payload_hex = str(getattr(packet.data, 'data', ''))
@@ -1090,10 +1222,11 @@ class PacketDecompiler:
                     "layer": "DATA",
                     "size": len(payload_hex) // 2,
                     "hex": payload_hex[:200],
-                    "ascii": self._hex_to_ascii(payload_hex[:200])
+                    "ascii": self._hex_to_ascii(payload_hex[:200]),
+                    "text": self._decode_hex_to_text(payload_hex)
                 })
                 payload_info["total_payload_size"] += len(payload_hex) // 2
-        
+
         except Exception as e:
             print(f"提取payload失败: {e}")
         
@@ -1106,6 +1239,117 @@ class PacketDecompiler:
             return ''.join(chr(b) if 32 <= b < 127 else '.' for b in data)
         except:
             return ""
+
+    def _decode_hex_to_text(self, hex_str, max_len=4000):
+        """将十六进制字符串转换为可读文本（utf-8），用于AI友好输出"""
+        try:
+            if hex_str is None:
+                return ""
+            cleaned = str(hex_str).replace(' ', '').replace(':', '')
+            if not cleaned:
+                return ""
+            text = bytes.fromhex(cleaned).decode('utf-8', errors='ignore')
+            text = self._to_printable_text(text)
+            if len(text) > max_len:
+                return text[:max_len] + "...(truncated)"
+            return text
+        except:
+            return ""
+
+    def _decode_bytes_to_text(self, data_bytes, max_len=4000):
+        """将字节数据转换为可读文本（utf-8），用于AI友好输出"""
+        try:
+            if not data_bytes:
+                return ""
+            text = data_bytes.decode('utf-8', errors='ignore')
+            text = self._to_printable_text(text)
+            if not text.strip():
+                text = ''.join(chr(b) if 32 <= b < 127 else '.' for b in data_bytes)
+            if len(text) > max_len:
+                return text[:max_len] + "...(truncated)"
+            return text
+        except:
+            return ""
+
+    def _to_printable_text(self, text, max_len=None):
+        """将不可见字符替换为 '.'，避免JSON中出现控制字符转义"""
+        if text is None:
+            return ""
+        safe_chars = []
+        for ch in str(text):
+            code = ord(ch)
+            if ch in ("\n", "\r", "\t"):
+                safe_chars.append(ch)
+            elif 32 <= code < 127:
+                safe_chars.append(ch)
+            else:
+                safe_chars.append(".")
+        safe_text = "".join(safe_chars)
+        if max_len and len(safe_text) > max_len:
+            return safe_text[:max_len] + "...(truncated)"
+        return safe_text
+
+    def _get_tcp_segment(self, packet):
+        """本地解码TCP十六进制payload为原始字节"""
+        try:
+            payload = get_tcp_segment(packet)
+            if payload:
+                return payload
+        except Exception:
+            return b""
+        return b""
+
+    def _extract_readable_payloads(self, packet, max_len=2000):
+        """按协议类型提取可读payload文本，优先解码"""
+        readable = []
+
+        def add_payload(source, raw_value):
+            if raw_value is None:
+                return
+            raw_str = str(raw_value)
+            text = self._decode_hex_to_text(raw_str, max_len=max_len)
+            if not text:
+                # 如果不是hex，直接取可打印字符
+                text = self._to_printable_text(raw_str)
+            if text:
+                readable.append({
+                    "source": source,
+                    "text": self._to_printable_text(text, max_len=max_len),
+                    "raw_preview": raw_str[:200]
+                })
+
+        try:
+            # TCP 重组字段
+            if hasattr(packet, 'tcp'):
+                tcp_bytes = self._get_tcp_segment(packet)
+                tcp_text = self._decode_bytes_to_text(tcp_bytes, max_len=max_len)
+                if tcp_text:
+                    readable.append({
+                        "source": "TCP.payload",
+                        "text": self._to_printable_text(tcp_text, max_len=max_len),
+                        "raw_preview": str(getattr(packet.tcp, 'payload', ''))[:200]
+                    })
+                for field in ['payload', 'segment_data', 'reassembled_data']:
+                    if hasattr(packet.tcp, field):
+                        add_payload(f"TCP.{field}", getattr(packet.tcp, field))
+
+            if hasattr(packet, 'udp') and hasattr(packet.udp, 'payload'):
+                add_payload("UDP.payload", getattr(packet.udp, 'payload', ''))
+
+            # HTTP 明文字段
+            if hasattr(packet, 'http'):
+                for field in ['file_data', 'request_full_uri', 'request_uri', 'request_body', 'response_phrase', 'response_code', 'user_agent']:
+                    if hasattr(packet.http, field):
+                        add_payload(f"HTTP.{field}", getattr(packet.http, field))
+
+            # 通用 data 层
+            if hasattr(packet, 'data') and hasattr(packet.data, 'data'):
+                add_payload("DATA.data", getattr(packet.data, 'data', ''))
+
+        except Exception as e:
+            print(f"提取可读payload失败: {e}")
+
+        return readable
     
     def decompile_packets_bulk(self, packets, max_packets=None):
         """
@@ -1159,7 +1403,14 @@ class PacketDecompiler:
                 text += '\n'.join(hex_lines[:10]) + "\n"
                 if len(hex_lines) > 10:
                     text += f"... 还有 {len(hex_lines) - 10} 行 ...\n"
-            
+            if packet_data.get('raw_text_preview'):
+                text += "\n【原始文本预览】(已尝试UTF-8解码，截断展示):\n"
+                preview = packet_data['raw_text_preview']
+                text += preview if len(preview) <= 800 else preview[:800] + "\n...(truncated)...\n"
+            if packet_data.get('printable_strings'):
+                text += "\n【可见字符串】(类似Wireshark可读片段):\n"
+                text += packet_data['printable_strings'][:1200] + "\n"
+
             # 添加payload信息
             if packet_data.get('payload', {}).get('layers_with_payload'):
                 text += f"\n【Payload信息】\n"
@@ -1169,7 +1420,14 @@ class PacketDecompiler:
                     if payload['hex']:
                         text += f"    Hex: {payload['hex']}\n"
                         text += f"    ASCII: {payload['ascii']}\n"
-            
+                    if payload.get('text'):
+                        text += f"    Text: {payload['text']}\n"
+
+            if packet_data.get('readable_payloads'):
+                text += "\n【可读Payload摘录】\n"
+                for rp in packet_data['readable_payloads'][:5]:
+                    text += f"  - 来源: {rp['source']} | 预览: {rp['text'][:300]}\n"
+
             text += "\n" + "="*60 + "\n"
             formatted.append(text)
         

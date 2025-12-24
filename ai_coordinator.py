@@ -29,9 +29,15 @@ class AICoordinatorWorker(QObject):
     def run(self):
         """执行AI分析任务 - 新的两阶段分析流程"""
         try:
+            # 二次研判：用户选定数据包范围，直接筛选疑似flag（不走两阶段/分块正则）
+            if any(item.get("type") == "PACKET_RANGE" for item in self.prompt_data):
+                result = self.analyze_packet_range()
+                self.finished.emit(result)
+                return
+
             # 首先检查数据中是否包含分块标记
             has_chunks = any(item.get('type') in ['CHUNK_START', 'CHUNK_COMPLETE', 'CHUNK_SUMMARY'] for item in self.prompt_data)
-            
+
             if has_chunks:
                 print("[AI分析] 检测到分块数据，使用两阶段分析模式...")
                 result = self.two_stage_analysis()
@@ -69,6 +75,83 @@ class AICoordinatorWorker(QObject):
             self.finished.emit(result)
         except Exception as e:
             self.error.emit(str(e))
+
+    def analyze_packet_range(self):
+        """二次研判：直接从选定的数据包JSON中筛选疑似flag/凭证"""
+        import json as json_lib
+
+        packet_items = [item for item in self.prompt_data if item.get("type") == "PACKET_RANGE"]
+        packets = []
+        range_labels = []
+
+        for item in packet_items:
+            if item.get("packet_range"):
+                range_labels.append(str(item.get("packet_range")))
+            item_packets = item.get("packets")
+            if isinstance(item_packets, list) and item_packets:
+                packets.extend(item_packets)
+                continue
+            content = item.get("content")
+            if content:
+                try:
+                    parsed = json_lib.loads(content)
+                    if isinstance(parsed, list):
+                        packets.extend(parsed)
+                except Exception:
+                    continue
+
+        if not packets:
+            return {
+                "flags": [],
+                "raw_response": "未收到可用的JSON数据包内容，请确认已正确传输数据包。",
+                "status": "no_data",
+                "analysis": "二次研判失败：没有可用的数据包JSON。"
+            }
+
+        total_packets = len(packets)
+        chunk_size = 40
+        chunks = [packets]
+        if total_packets > 60:
+            chunks = [packets[i:i + chunk_size] for i in range(0, total_packets, chunk_size)]
+
+        user_hint = f"\n【用户补充】\n{self.user_prompt}\n" if self.user_prompt else ""
+        range_hint = f"（范围: {', '.join(range_labels)}）" if range_labels else ""
+
+        all_flags = []
+        raw_parts = []
+        for idx, chunk in enumerate(chunks, 1):
+            prompt = f"""你是CTF流量分析助手，请直接从以下数据包JSON中筛选疑似flag/密钥/凭证。
+
+【数据包JSON{range_hint}】
+{json_lib.dumps(chunk, ensure_ascii=False, indent=2)}
+{user_hint}
+【任务】
+1. 直接给出所有疑似flag/凭证（优先flag{{...}}/FLAG{{...}}/ctf{{...}}）。
+2. 对每条结果给出所在包号/字段路径或片段证据。
+3. 若需要解码（base64/hex/url/gzip），请写出解码后的结果。
+
+【输出要求】
+- 不要生成正则表达式
+- 列表输出，每条一行
+"""
+            api_result = self.call_iflow_model(prompt)
+            raw_response = api_result.get("raw_response", "")
+            if raw_response:
+                if len(chunks) > 1:
+                    raw_parts.append(f"[分段 {idx}/{len(chunks)}]\n{raw_response}")
+                else:
+                    raw_parts.append(raw_response)
+            all_flags.extend(self.extract_flags_from_result(api_result))
+
+        unique_flags = list(set(all_flags))
+        combined_raw = "\n\n".join(raw_parts)
+
+        return {
+            "flags": unique_flags,
+            "raw_response": combined_raw,
+            "status": "success",
+            "analysis": f"二次研判完成：处理{total_packets}个数据包，发现{len(unique_flags)}个可疑flag"
+        }
     
     def two_stage_analysis(self):
         """两阶段分析流程：
@@ -912,6 +995,12 @@ class AICoordinatorWorker(QObject):
     
     def construct_prompt(self):
         """构造发送给AI的提示词（限制上下文窗口不超过256K字符）"""
+        # 如果 prompt_data 为空，直接使用 user_prompt（用于 AI 初筛等不需要分析数据的场景）
+        if not self.prompt_data:
+            prompt = self.user_prompt
+            print("[提示词] 使用用户提示词（不包含数据）")
+            return prompt
+        
         # 最大token限制（256K）
         MAX_CONTEXT_SIZE = 256000  # 约256K字符
         SYSTEM_PROMPT_SIZE = 1000  # 系统提示词的基础大小
