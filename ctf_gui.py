@@ -423,8 +423,9 @@ class CTFXRayMainWindow(QMainWindow):
         """使用AI对网络流量进行深度分析"""
         # 使用保存的原始分析结果（包含json_file路径）
         if hasattr(self, 'network_analysis_results') and self.network_analysis_results:
-            # 清空AI对话框和对话历史，开始新的对话
-            self.ai_response_display.setPlainText("")
+            # 清空AI推理过程和对话历史，开始新的对话
+            self.reasoning_display.setPlainText("")
+            self.conversation_display.setPlainText("")
             self.conversation_history = []
             
             # 切换到AI标签页
@@ -626,8 +627,9 @@ class CTFXRayMainWindow(QMainWindow):
         if user_prompt or analysis_data:
             self.statusBar().showMessage("正在向AI发送请求...")
             self.ask_ai_btn.setEnabled(False)
-            # 清空AI响应框（新的询问开始）
-            self.ai_response_display.setPlainText("")
+            # 清空AI推理过程和Flag列表（新的询问开始）
+            self.reasoning_display.setPlainText("")
+            self.flag_list.clear()
             # 传递原始分析结果给AI分析（包含json_file路径）
             self.ai_coordinator.analyze(analysis_data, user_prompt, api_key, model, 
                                        conversation_history=self.conversation_history)
