@@ -49,56 +49,99 @@ class CTFXRayMainWindow(QMainWindow):
         self.statusBar().showMessage("就绪")
         
     def create_network_tab(self):
-        """创建网络流量分析标签页"""
+        """创建网络流量分析标签页 - 新流程：导入→题目→初筛→展示"""
         self.network_tab = QWidget()
-        layout = QVBoxLayout()
+        main_layout = QVBoxLayout()
         
-        # 控制区域
-        control_group = QGroupBox("控制面板")
-        control_layout = QHBoxLayout()
+        # 第一步：文件导入区域
+        import_group = QGroupBox("第一步：导入 PCAP 文件")
+        import_layout = QHBoxLayout()
         
-        self.pcap_file_btn = QPushButton("选择PCAP文件")
+        self.pcap_file_btn = QPushButton("选择 PCAP 文件")
         self.pcap_file_btn.clicked.connect(self.select_pcap_file)
-        
-        self.capture_btn = QPushButton("开始实时抓包")
-        self.capture_btn.clicked.connect(self.start_capture)
-        
-        self.network_analyze_btn = QPushButton("分析")
-        self.network_analyze_btn.clicked.connect(self.analyze_network)
-        self.network_analyze_btn.setEnabled(False)
-        
-        # 添加AI深度分析按钮
-        self.network_ai_analyze_btn = QPushButton("AI深度分析")
-        self.network_ai_analyze_btn.clicked.connect(self.network_ai_analyze)
-        self.network_ai_analyze_btn.setEnabled(False)
-        
-        control_layout.addWidget(self.pcap_file_btn)
-        control_layout.addWidget(self.capture_btn)
-        control_layout.addWidget(self.network_analyze_btn)
-        control_layout.addWidget(self.network_ai_analyze_btn)
-        control_layout.addStretch()
-        
-        control_group.setLayout(control_layout)
-        layout.addWidget(control_group)
-        
-        # 文件信息显示
         self.network_file_label = QLabel("未选择文件")
-        layout.addWidget(self.network_file_label)
         
-        # 结果显示区域
-        self.network_results = QTableWidget()
-        self.network_results.setColumnCount(4)
-        self.network_results.setHorizontalHeaderLabels(["类型", "源地址", "目标地址", "内容"])
-        self.network_results.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
-        layout.addWidget(self.network_results)
+        self.start_capture_btn = QPushButton("或开始实时抓包")
+        self.start_capture_btn.clicked.connect(self.start_capture)
         
-        # 添加查看分析过程按钮
-        self.view_network_process_btn = QPushButton("查看分析过程")
-        self.view_network_process_btn.clicked.connect(self.view_network_process)
-        self.view_network_process_btn.setEnabled(False)
-        layout.addWidget(self.view_network_process_btn)
+        import_layout.addWidget(self.pcap_file_btn)
+        import_layout.addWidget(self.network_file_label)
+        import_layout.addWidget(self.start_capture_btn)
+        import_layout.addStretch()
         
-        self.network_tab.setLayout(layout)
+        import_group.setLayout(import_layout)
+        main_layout.addWidget(import_group)
+        
+        # 第二步：题目描述区域
+        problem_group = QGroupBox("第二步：输入题目描述")
+        problem_layout = QVBoxLayout()
+        
+        problem_label = QLabel("请输入题目要求和关键词（AI 将根据文件名和题目描述进行初筛）：")
+        self.network_problem_input = QTextEdit()
+        self.network_problem_input.setPlaceholderText(
+            "例如：\n"
+            "题目：在 HTTP 流量中找到 flag\n"
+            "关键词：password、secret、flag\n"
+            "文件类型：jpg、png、txt"
+        )
+        self.network_problem_input.setMaximumHeight(80)
+        
+        # AI初筛按钮
+        self.network_initial_analyze_btn = QPushButton("开始 AI 初筛")
+        self.network_initial_analyze_btn.clicked.connect(self.network_initial_analyze)
+        self.network_initial_analyze_btn.setEnabled(False)
+        
+        problem_layout.addWidget(problem_label)
+        problem_layout.addWidget(self.network_problem_input)
+        problem_layout.addWidget(self.network_initial_analyze_btn)
+        
+        problem_group.setLayout(problem_layout)
+        main_layout.addWidget(problem_group)
+        
+        # 第三步：分析结果展示区域
+        result_group = QGroupBox("第三步：AI 初筛结果")
+        result_layout = QVBoxLayout()
+        
+        # 创建标签页来展示不同的结果
+        self.network_result_tabs = QTabWidget()
+        
+        # 高匹配数据包标签
+        self.high_match_list = QListWidget()
+        self.network_result_tabs.addTab(self.high_match_list, "高匹配数据包")
+        
+        # Wireshark 正则
+        self.wireshark_regex_display = QTextEdit()
+        self.wireshark_regex_display.setReadOnly(True)
+        self.network_result_tabs.addTab(self.wireshark_regex_display, "Wireshark 正则")
+        
+        # 高频数据条目
+        self.high_frequency_display = QTextEdit()
+        self.high_frequency_display.setReadOnly(True)
+        self.network_result_tabs.addTab(self.high_frequency_display, "高频数据条目")
+        
+        result_layout.addWidget(self.network_result_tabs)
+        
+        # 操作按钮
+        action_layout = QHBoxLayout()
+        
+        self.network_export_json_btn = QPushButton("导出高频条目到 JSON")
+        self.network_export_json_btn.clicked.connect(self.network_export_json)
+        self.network_export_json_btn.setEnabled(False)
+        
+        self.network_secondary_analyze_btn = QPushButton("二次深度研判")
+        self.network_secondary_analyze_btn.clicked.connect(self.network_secondary_analyze)
+        self.network_secondary_analyze_btn.setEnabled(False)
+        
+        action_layout.addWidget(self.network_export_json_btn)
+        action_layout.addWidget(self.network_secondary_analyze_btn)
+        action_layout.addStretch()
+        
+        result_layout.addLayout(action_layout)
+        
+        result_group.setLayout(result_layout)
+        main_layout.addWidget(result_group)
+        
+        self.network_tab.setLayout(main_layout)
         self.tabs.addTab(self.network_tab, "流量分析")
         
     def create_log_tab(self):
@@ -346,9 +389,11 @@ class CTFXRayMainWindow(QMainWindow):
         file_path, _ = QFileDialog.getOpenFileName(
             self, "选择PCAP文件", "", "PCAP文件 (*.pcap *.pcapng);;所有文件 (*)")
         if file_path:
-            self.network_file_label.setText(file_path)
-            self.network_analyze_btn.setEnabled(True)
+            self.network_file_label.setText(f"已选择：{file_path}")
             self.selected_pcap_file = file_path
+            # 启用题目输入和初筛按钮
+            self.network_initial_analyze_btn.setEnabled(True)
+            self.statusBar().showMessage("PCAP 文件已加载，请输入题目描述后进行初筛")
             
     def start_capture(self):
         """开始实时抓包"""
@@ -371,81 +416,106 @@ class CTFXRayMainWindow(QMainWindow):
         # 清空对话历史
         self.conversation_history = []
         print("[清理] 已清空对话历史")
+    
+    def network_initial_analyze(self):
+        """AI 初筛：根据文件名和题目描述进行初筛"""
+        if not hasattr(self, 'selected_pcap_file'):
+            QMessageBox.warning(self, "警告", "请先选择 PCAP 文件")
+            return
         
+        problem_desc = self.network_problem_input.toPlainText()
+        if not problem_desc.strip():
+            QMessageBox.warning(self, "警告", "请输入题目描述")
+            return
+        
+        # 清除旧数据
+        self._cleanup_analysis_data()
+        
+        # 首先分析PCAP文件
+        self.statusBar().showMessage("正在分析 PCAP 文件...")
+        self.network_initial_analyze_btn.setEnabled(False)
+        
+        # 保存题目描述供后续使用
+        self.network_problem_description = problem_desc
+        
+        # 调用分析器
+        self.pcap_analyzer.analyze(self.selected_pcap_file)
+    
     def analyze_network(self):
-        """分析网络流量"""
-        if hasattr(self, 'selected_pcap_file'):
-            # 清除旧的tmp文件夹和对话历史，避免数据冲突
-            self._cleanup_analysis_data()
-            
-            self.statusBar().showMessage("正在分析网络流量...")
-            self.network_analyze_btn.setEnabled(False)
-            self.pcap_analyzer.analyze(self.selected_pcap_file)
+        """分析网络流量（仅在PCAP分析完成后调用）"""
+        # 此方法已由 network_initial_analyze 替代
+        pass
             
     def on_network_analysis_finished(self, results):
-        """网络分析完成回调"""
-        # 提取分析过程信息
-        analysis_process = None
-        clean_results = []
-        for result in results:
-            if result.get("type") == "ANALYSIS_PROCESS":
-                analysis_process = result.get("content", "")
-            else:
-                clean_results.append(result)
-        
-        # 保存分析结果（包括json_file路径）- 用于AI分析
+        """网络分析完成回调 - 新流程：PCAP分析后立即进行AI初筛"""
+        # 保存分析结果（包括json_file路径）
         self.network_analysis_results = results
         
-        # 保存分析过程
-        self.network_analysis_process = analysis_process
+        # 清空显示区域
+        self.high_match_list.clear()
+        self.wireshark_regex_display.setPlainText("")
+        self.high_frequency_display.setPlainText("")
         
-        # 启用查看按钮
-        self.view_network_process_btn.setEnabled(analysis_process is not None)
+        # 检查是否有JSON文件
+        json_files = [r.get('json_file') for r in results if r.get('json_file')]
         
-        # 显示结果
-        self.network_results.setRowCount(0)  # 清空现有结果
+        if not json_files:
+            QMessageBox.warning(self, "错误", "未能生成JSON分析文件，请检查PCAP文件")
+            self.network_initial_analyze_btn.setEnabled(True)
+            return
         
-        for result in clean_results:
-            row_position = self.network_results.rowCount()
-            self.network_results.insertRow(row_position)
-            
-            self.network_results.setItem(row_position, 0, QTableWidgetItem(result.get("type", "")))
-            self.network_results.setItem(row_position, 1, QTableWidgetItem(result.get("src", "")))
-            self.network_results.setItem(row_position, 2, QTableWidgetItem(result.get("dst", "")))
-            self.network_results.setItem(row_position, 3, QTableWidgetItem(result.get("content", "")))
-            
-        self.statusBar().showMessage(f"网络分析完成，发现{len(clean_results)}条记录")
-        self.network_analyze_btn.setEnabled(True)
-        # 启用AI深度分析按钮
-        self.network_ai_analyze_btn.setEnabled(len(clean_results) > 0)
+        # 现在调用AI进行初筛
+        print(f"[GUI] PCAP分析完成，{len(json_files)} 个JSON文件已生成")
+        self.statusBar().showMessage("PCAP 分析完成，正在进行 AI 初筛...")
         
+        # 调用AI协调器进行初筛
+        self._do_ai_initial_screening()
+    
+    def _do_ai_initial_screening(self):
+        """执行AI初筛"""
+        if not hasattr(self, 'network_problem_description'):
+            QMessageBox.warning(self, "错误", "找不到题目描述")
+            return
+        
+        # 构建初筛提示
+        problem = self.network_problem_description
+        pcap_filename = self.selected_pcap_file.split('\\')[-1] if hasattr(self, 'selected_pcap_file') else "unknown.pcap"
+        
+        initial_screening_prompt = f"""【文件名】{pcap_filename}
+
+【题目描述】
+{problem}
+
+【任务】
+基于文件名、题目描述和数据包内容，执行初筛任务：
+1. **识别高匹配数据包**：根据题目关键词找出最相关的数据包
+2. **生成 Wireshark 正则**：输出可以在 Wireshark 中使用的正则表达式来快速过滤
+3. **统计高频条目**：提取频繁出现的关键字段、URL、域名等
+
+【输出格式】
+分别输出：
+1. 高匹配包（数据包号）
+2. Wireshark 正则
+3. 高频数据条目 JSON
+"""
+        
+        # 使用分析数据作为上下文
+        analysis_data = self.network_analysis_results
+        
+        # 直接调用AI协调器
+        self.statusBar().showMessage("正在执行 AI 初筛...")
+        self.ai_coordinator.analyze(
+            analysis_data, 
+            initial_screening_prompt,
+            self.api_key_input.text(),
+            self.model_input.text(),
+            conversation_history=self.conversation_history
+        )
+    
     def network_ai_analyze(self):
         """使用AI对网络流量进行深度分析"""
-        # 使用保存的原始分析结果（包含json_file路径）
-        if hasattr(self, 'network_analysis_results') and self.network_analysis_results:
-            # 清空AI推理过程和对话历史，开始新的对话
-            self.reasoning_display.setPlainText("")
-            self.conversation_display.setPlainText("")
-            self.conversation_history = []
-            
-            # 切换到AI标签页
-            self.tabs.setCurrentWidget(self.ai_tab)
-            
-            # 显示分析数据源
-            ai_data = {
-                "source": "PCAP Network Analysis",
-                "result_count": len(self.network_analysis_results),
-                "has_json_files": any(r.get('json_file') for r in self.network_analysis_results),
-                "json_files": [r.get('json_file') for r in self.network_analysis_results if r.get('json_file')]
-            }
-            self.raw_data_display.setPlainText(f"网络流量分析结果已加载:\n{json.dumps(ai_data, indent=2, ensure_ascii=False)}")
-            
-            # 自动填充用户提示
-            self.user_prompt_input.setPlainText("请对提供的PCAP网络流量数据进行全面分析，识别所有可疑的flag、hash值、异常流量特征")
-            
-            self.statusBar().showMessage(f"已加载{len(self.network_analysis_results)}条分析结果，包含{len([r.get('json_file') for r in self.network_analysis_results if r.get('json_file')])}个JSON文件，请点击'询问AI'进行深度分析")
-        else:
-            QMessageBox.warning(self, "警告", "没有可供分析的网络流量数据，请先执行流量分析")
+        # 此方法已由新流程替代
+        pass
 
     # 日志分析相关方法
     def select_log_file(self):
@@ -637,29 +707,154 @@ class CTFXRayMainWindow(QMainWindow):
             QMessageBox.warning(self, "警告", "请输入提示内容或选择数据")
     
     def on_ai_analysis_finished(self, result):
-        """AI分析完成回调"""
+        """AI分析完成回调 - 处理初筛结果或深度研判结果"""
         self.ask_ai_btn.setEnabled(True)
         
+        # 检查是否是流量分析页面的初筛
+        if hasattr(self, 'network_problem_description') and 'network_initial_analyze_btn' in dir(self):
+            # 这是初筛结果
+            self._handle_initial_screening_result(result)
+        else:
+            # 这是AI协同页面的结果
+            self._handle_ai_analysis_result(result)
+    
+    def _handle_initial_screening_result(self, result):
+        """处理初筛结果"""
+        print("[GUI] 处理初筛结果...")
+        
+        raw_response = result.get("raw_response", "")
+        
+        # 清空显示
+        self.high_match_list.clear()
+        self.wireshark_regex_display.setPlainText("")
+        self.high_frequency_display.setPlainText("")
+        
+        # 解析AI的初筛结果
+        # 预期格式：
+        # 【高匹配包】...
+        # 【Wireshark正则】...
+        # 【高频数据条目】...JSON...
+        
+        import re as re_lib
+        
+        # 提取高匹配包
+        high_match_section = re_lib.search(r'【高匹配包】(.*?)(?=【|$)', raw_response, re_lib.DOTALL)
+        if high_match_section:
+            high_match_text = high_match_section.group(1).strip()
+            packages = re_lib.findall(r'#?\d+|数据包\s*#?\d+', high_match_text)
+            for pkg in packages:
+                self.high_match_list.addItem(pkg)
+            print(f"[GUI] 提取到 {len(packages)} 个高匹配包")
+        
+        # 提取 Wireshark 正则
+        regex_section = re_lib.search(r'【Wireshark正则|【Wireshark\s*正则】(.*?)(?=【|$)', raw_response, re_lib.DOTALL)
+        if regex_section:
+            regex_text = regex_section.group(1).strip()
+            self.wireshark_regex_display.setPlainText(regex_text)
+            print(f"[GUI] 提取到 Wireshark 正则")
+        
+        # 提取高频数据条目（JSON）
+        freq_section = re_lib.search(r'【高频数据条目】(.*?)(?=【|$)', raw_response, re_lib.DOTALL)
+        if freq_section:
+            freq_text = freq_section.group(1).strip()
+            # 尝试解析JSON
+            try:
+                import json as json_lib
+                # 查找JSON部分
+                json_match = re_lib.search(r'\{.*\}', freq_text, re_lib.DOTALL)
+                if json_match:
+                    freq_json = json_lib.loads(json_match.group(0))
+                    # 保存到全局变量供后续使用
+                    self.high_frequency_data = freq_json
+                    self.high_frequency_display.setPlainText(json_lib.dumps(freq_json, indent=2, ensure_ascii=False))
+                    print(f"[GUI] 提取到高频数据条目 JSON")
+            except:
+                # 如果JSON解析失败，直接显示文本
+                self.high_frequency_display.setPlainText(freq_text)
+        
+        # 启用导出和二次研判按钮
+        self.network_export_json_btn.setEnabled(True)
+        self.network_secondary_analyze_btn.setEnabled(True)
+        self.network_initial_analyze_btn.setEnabled(True)
+        
+        self.statusBar().showMessage(
+            f"✓ AI 初筛完成！发现 {self.high_match_list.count()} 个高匹配包，"
+            f"已生成 Wireshark 正则和高频数据条目。"
+        )
+    
+    def network_export_json(self):
+        """导出高频数据条目到 JSON"""
+        if not hasattr(self, 'high_frequency_data'):
+            QMessageBox.warning(self, "警告", "没有可导出的数据")
+            return
+        
+        from pathlib import Path
+        import json as json_lib
+        
+        # 创建 tmp 目录
+        tmp_dir = Path("tmp")
+        tmp_dir.mkdir(exist_ok=True)
+        
+        # 保存高频数据到 JSON
+        output_file = tmp_dir / "high_frequency_items.json"
+        try:
+            with open(output_file, 'w', encoding='utf-8') as f:
+                json_lib.dump(self.high_frequency_data, f, indent=2, ensure_ascii=False)
+            
+            QMessageBox.information(self, "成功", f"高频数据条目已导出到：\n{output_file}")
+            self.statusBar().showMessage(f"高频数据已导出到 {output_file}")
+        except Exception as e:
+            QMessageBox.critical(self, "错误", f"导出失败：{e}")
+    
+    def network_secondary_analyze(self):
+        """二次深度研判"""
+        if not hasattr(self, 'high_frequency_data'):
+            QMessageBox.warning(self, "警告", "请先完成初筛")
+            return
+        
+        # 切换到AI协同页面
+        self.tabs.setCurrentWidget(self.ai_tab)
+        
+        # 清空AI显示区域
+        self.reasoning_display.setPlainText("")
+        self.conversation_display.setPlainText("")
+        self.flag_list.clear()
+        self.conversation_history = []
+        
+        # 构建二次研判的提示
+        import json as json_lib
+        secondary_prompt = f"""根据以下初筛结果和高频数据条目，进行二次深度研判：
+
+【高频数据条目】
+{json_lib.dumps(self.high_frequency_data, ensure_ascii=False, indent=2)}
+
+【任务】
+1. 分析这些高频条目中是否包含明显的flag或关键信息
+2. 提取所有可能的flag、hash值、密钥等敏感信息
+3. 分析这些数据的含义和用途
+
+【输出】
+直接列出发现的所有flag和关键信息。
+"""
+        
+        # 填充AI页面
+        self.raw_data_display.setPlainText(f"高频数据条目：\n{json_lib.dumps(self.high_frequency_data, ensure_ascii=False, indent=2)}")
+        self.user_prompt_input.setPlainText(secondary_prompt)
+        
+        self.statusBar().showMessage("已加载高频数据，请点击'询问AI'进行二次研判")
+    
+    def _handle_ai_analysis_result(self, result):
+        """处理AI协同页面的分析结果"""
         # 处理分析状态
         analysis_status = result.get("status", "")
         
         # 如果是正则匹配阶段
         if analysis_status == "regex_matched":
             self.statusBar().showMessage("✓ 正则筛选完成，已匹配到可疑flag")
-            print(f"\n[GUI] 检测到正则匹配结果，展示匹配细节...")
             
             # 显示分析过程
             analysis_text = result.get("analysis", "")
             self.reasoning_display.setPlainText(f"【两阶段分析结果】\n\n{analysis_text}")
-            
-            # 显示正则模式
-            regex_patterns = result.get("regex_patterns", [])
-            if regex_patterns:
-                pattern_text = "\n".join([f"- {p}" for p in regex_patterns])
-                self.reasoning_display.setPlainText(
-                    self.reasoning_display.toPlainText() + 
-                    f"\n\n【使用的筛选正则】\n{pattern_text}"
-                )
             
             # 显示匹配的flag
             flags = result.get("flags", [])
@@ -668,25 +863,9 @@ class CTFXRayMainWindow(QMainWindow):
                     if flag:
                         self.flag_list.addItem(f"[正则匹配] {flag}")
                 
-                # 显示匹配详情
-                match_details = result.get("match_details", [])
-                if match_details:
-                    details_text = "\n【匹配详情】\n"
-                    for detail in match_details:
-                        details_text += f"\n文件: {detail.get('file', '')}, 数据包 #{detail.get('packet_index', '')}\n"
-                        if detail.get('matched_content'):
-                            details_text += f"匹配内容: {', '.join(detail['matched_content'])}\n"
-                    
-                    self.reasoning_display.setPlainText(
-                        self.reasoning_display.toPlainText() + details_text
-                    )
-                
                 self.statusBar().showMessage(
-                    f"✓ 正则匹配成功！发现 {len(flags)} 个可疑flag, "
-                    f"{result.get('filtered_packets', []).__len__()} 个相关数据包。请研判以下内容。"
+                    f"✓ 正则匹配成功！发现 {len(flags)} 个可疑flag"
                 )
-            else:
-                self.statusBar().showMessage("正则筛选完成，但未匹配到明确的flag")
         
         # 普通分析完成
         else:
@@ -703,36 +882,30 @@ class CTFXRayMainWindow(QMainWindow):
             
             # 更新对话历史
             if raw_response:
-                # 获取最后输入的用户提示
                 user_prompt = self.user_prompt_input.toPlainText()
                 if user_prompt:
                     self.conversation_history.append({
                         "role": "user",
                         "content": user_prompt
                     })
-                # 添加AI响应到对话历史
                 self.conversation_history.append({
                     "role": "assistant",
                     "content": raw_response
                 })
             
-            # 在推理显示区域直接显示AI的完整响应（不需要JSON格式）
+            # 显示AI响应
             self.reasoning_display.setPlainText(raw_response)
-            
-            # 更新对话历史显示
             self.update_conversation_display()
             
             # 显示AI推理结果
-            flags = result.get("flags", [])  # 获取多个flag
+            flags = result.get("flags", [])
             
-            # 如果检测到flag，添加到候选列表
             if flags:
                 for flag in flags:
-                    if flag:  # 确保flag不为空
+                    if flag:
                         self.flag_list.addItem(flag)
                 self.statusBar().showMessage(f"AI分析完成，发现 {len(flags)} 个可能的flag")
             else:
-                # 检查旧格式的flag字段（为了向后兼容）
                 old_flag = result.get("flag", "")
                 if old_flag:
                     self.flag_list.addItem(old_flag)
