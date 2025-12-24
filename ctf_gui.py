@@ -639,55 +639,106 @@ class CTFXRayMainWindow(QMainWindow):
     def on_ai_analysis_finished(self, result):
         """AI分析完成回调"""
         self.ask_ai_btn.setEnabled(True)
-        self.statusBar().showMessage("AI分析完成")
         
-        # 保存完整响应过程数据
-        self.full_response_data = result.get("full_response_process", {})
+        # 处理分析状态
+        analysis_status = result.get("status", "")
         
-        # 启用查看完整响应过程按钮
-        self.view_full_response_btn.setEnabled(bool(self.full_response_data))
-        
-        # 获取原始AI响应文本
-        raw_response = result.get("raw_response", "")
-        
-        # 更新对话历史
-        if raw_response:
-            # 获取最后输入的用户提示
-            user_prompt = self.user_prompt_input.toPlainText()
-            if user_prompt:
-                self.conversation_history.append({
-                    "role": "user",
-                    "content": user_prompt
-                })
-            # 添加AI响应到对话历史
-            self.conversation_history.append({
-                "role": "assistant",
-                "content": raw_response
-            })
-        
-        # 在推理显示区域直接显示AI的完整响应（不需要JSON格式）
-        self.reasoning_display.setPlainText(raw_response)
-        
-        # 更新对话历史显示
-        self.update_conversation_display()
-        
-        # 显示AI推理结果
-        flags = result.get("flags", [])  # 获取多个flag
-        
-        # 如果检测到flag，添加到候选列表
-        if flags:
-            for flag in flags:
-                if flag:  # 确保flag不为空
-                    self.flag_list.addItem(flag)
-            self.statusBar().showMessage(f"AI分析完成，发现 {len(flags)} 个可能的flag")
-        else:
-            # 检查旧格式的flag字段（为了向后兼容）
-            old_flag = result.get("flag", "")
-            if old_flag:
-                self.flag_list.addItem(old_flag)
-                self.statusBar().showMessage("AI分析完成，发现1个可能的flag")
+        # 如果是正则匹配阶段
+        if analysis_status == "regex_matched":
+            self.statusBar().showMessage("✓ 正则筛选完成，已匹配到可疑flag")
+            print(f"\n[GUI] 检测到正则匹配结果，展示匹配细节...")
+            
+            # 显示分析过程
+            analysis_text = result.get("analysis", "")
+            self.reasoning_display.setPlainText(f"【两阶段分析结果】\n\n{analysis_text}")
+            
+            # 显示正则模式
+            regex_patterns = result.get("regex_patterns", [])
+            if regex_patterns:
+                pattern_text = "\n".join([f"- {p}" for p in regex_patterns])
+                self.reasoning_display.setPlainText(
+                    self.reasoning_display.toPlainText() + 
+                    f"\n\n【使用的筛选正则】\n{pattern_text}"
+                )
+            
+            # 显示匹配的flag
+            flags = result.get("flags", [])
+            if flags:
+                for flag in flags:
+                    if flag:
+                        self.flag_list.addItem(f"[正则匹配] {flag}")
+                
+                # 显示匹配详情
+                match_details = result.get("match_details", [])
+                if match_details:
+                    details_text = "\n【匹配详情】\n"
+                    for detail in match_details:
+                        details_text += f"\n文件: {detail.get('file', '')}, 数据包 #{detail.get('packet_index', '')}\n"
+                        if detail.get('matched_content'):
+                            details_text += f"匹配内容: {', '.join(detail['matched_content'])}\n"
+                    
+                    self.reasoning_display.setPlainText(
+                        self.reasoning_display.toPlainText() + details_text
+                    )
+                
+                self.statusBar().showMessage(
+                    f"✓ 正则匹配成功！发现 {len(flags)} 个可疑flag, "
+                    f"{result.get('filtered_packets', []).__len__()} 个相关数据包。请研判以下内容。"
+                )
             else:
-                self.statusBar().showMessage("AI分析完成，未发现flag")
+                self.statusBar().showMessage("正则筛选完成，但未匹配到明确的flag")
+        
+        # 普通分析完成
+        else:
+            self.statusBar().showMessage("AI分析完成")
+            
+            # 保存完整响应过程数据
+            self.full_response_data = result.get("full_response_process", {})
+            
+            # 启用查看完整响应过程按钮
+            self.view_full_response_btn.setEnabled(bool(self.full_response_data))
+            
+            # 获取原始AI响应文本
+            raw_response = result.get("raw_response", "")
+            
+            # 更新对话历史
+            if raw_response:
+                # 获取最后输入的用户提示
+                user_prompt = self.user_prompt_input.toPlainText()
+                if user_prompt:
+                    self.conversation_history.append({
+                        "role": "user",
+                        "content": user_prompt
+                    })
+                # 添加AI响应到对话历史
+                self.conversation_history.append({
+                    "role": "assistant",
+                    "content": raw_response
+                })
+            
+            # 在推理显示区域直接显示AI的完整响应（不需要JSON格式）
+            self.reasoning_display.setPlainText(raw_response)
+            
+            # 更新对话历史显示
+            self.update_conversation_display()
+            
+            # 显示AI推理结果
+            flags = result.get("flags", [])  # 获取多个flag
+            
+            # 如果检测到flag，添加到候选列表
+            if flags:
+                for flag in flags:
+                    if flag:  # 确保flag不为空
+                        self.flag_list.addItem(flag)
+                self.statusBar().showMessage(f"AI分析完成，发现 {len(flags)} 个可能的flag")
+            else:
+                # 检查旧格式的flag字段（为了向后兼容）
+                old_flag = result.get("flag", "")
+                if old_flag:
+                    self.flag_list.addItem(old_flag)
+                    self.statusBar().showMessage("AI分析完成，发现1个可能的flag")
+                else:
+                    self.statusBar().showMessage("AI分析完成，未发现flag")
 
     def view_full_response(self):
         """查看完整响应过程"""

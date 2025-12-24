@@ -27,22 +27,22 @@ class AICoordinatorWorker(QObject):
         self.conversation_history = conversation_history or []  # 对话历史
         
     def run(self):
-        """执行AI分析任务"""
+        """执行AI分析任务 - 新的两阶段分析流程"""
         try:
             # 首先检查数据中是否包含分块标记
             has_chunks = any(item.get('type') in ['CHUNK_START', 'CHUNK_COMPLETE', 'CHUNK_SUMMARY'] for item in self.prompt_data)
             
             if has_chunks:
-                print("[AI分析] 检测到分块数据，使用分块模式处理...")
-                result = self.process_chunked_data()
+                print("[AI分析] 检测到分块数据，使用两阶段分析模式...")
+                result = self.two_stage_analysis()
             else:
                 # 检查数据量是否过大，需要分批处理
                 total_content_length = sum(len(str(item.get('content', ''))) for item in self.prompt_data)
                 
                 # 如果内容超过50KB，使用分批处理
                 if total_content_length > 50000:
-                    print(f"[AI分析] 检测到大数据包({total_content_length}bytes)，使用分批处理...")
-                    result = self.process_in_batches()
+                    print(f"[AI分析] 检测到大数据包({total_content_length}bytes)，使用两阶段分析...")
+                    result = self.two_stage_analysis()
                 else:
                     # 小数据量直接处理
                     prompt = self.construct_prompt()
@@ -69,6 +69,214 @@ class AICoordinatorWorker(QObject):
             self.finished.emit(result)
         except Exception as e:
             self.error.emit(str(e))
+    
+    def two_stage_analysis(self):
+        """两阶段分析流程：
+        
+        阶段1：根据题目要求生成筛选正则
+        阶段2a：如果正则匹配到了flag，则展示数据包内容供用户研判
+        阶段2b：如果未匹配到flag，则继续用筛选后的数据包进行深度分析
+        """
+        from pathlib import Path
+        import json as json_lib
+        import re as re_lib
+        
+        print("[两阶段分析] 开始两阶段分析流程...")
+        
+        # 阶段1：让AI根据题目要求生成筛选正则
+        print("\n[阶段1] 根据题目要求生成筛选正则...")
+        
+        # 准备题目上下文（包含首个chunk作为样本）
+        tmp_dir = Path("tmp")
+        sample_json = None
+        sample_data = ""
+        
+        if tmp_dir.exists():
+            json_files = sorted(tmp_dir.glob("chunk_*.json"))
+            if json_files:
+                try:
+                    with open(json_files[0], 'r', encoding='utf-8') as f:
+                        sample_data = json_lib.load(f)
+                    # 仅展示前3个包作为样本
+                    sample_data = sample_data[:3] if isinstance(sample_data, list) else [sample_data]
+                except:
+                    sample_data = ""
+        
+        regex_prompt = f"""【题目要求】
+{self.user_prompt}
+
+【数据包样本】（用于理解数据结构）
+{json_lib.dumps(sample_data, ensure_ascii=False, indent=2)[:2000]}...
+
+【任务】
+基于以上题目要求，生成一个或多个正则表达式来筛选最可能包含flag的数据包。
+
+【输出格式】
+给出以下内容：
+1. **筛选策略**：说明你的筛选思路
+2. **正则表达式**：列出所有正则（使用中括号包围，如 [regex1], [regex2]）
+3. **匹配字段**：说明正则应该匹配数据包的哪些字段（内容、URL、域名等）
+
+例如：
+筛选策略：根据题目要求找含有"flag"或特定编码的包
+正则表达式：[flag\\{{[^}}]+\\}}], [ctf\\{{[^}}]+\\}}]
+匹配字段：所有数据包的所有字符串字段（payload、http内容等）
+"""
+        
+        try:
+            regex_result = self.call_iflow_model(regex_prompt)
+            regex_response = regex_result.get("raw_response", "")
+            print(f"\n[阶段1] AI生成的正则：\n{regex_response}\n")
+            
+            # 从响应中提取正则表达式
+            extracted_regexes = re_lib.findall(r'\[([^\]]+)\]', regex_response)
+            print(f"[阶段1] 提取到 {len(extracted_regexes)} 个正则表达式")
+            
+            if not extracted_regexes:
+                print("[阶段1] 未能提取到有效的正则，使用默认正则")
+                extracted_regexes = [r'flag\{[^}]+\}', r'FLAG\{[^}]+\}', r'ctf\{[^}]+\}']
+        except Exception as e:
+            print(f"[阶段1] 生成正则失败: {e}，使用默认正则")
+            extracted_regexes = [r'flag\{[^}]+\}', r'FLAG\{[^}]+\}', r'ctf\{[^}]+\}']
+        
+        # 阶段2：使用正则筛选数据包
+        print(f"\n[阶段2] 使用正则筛选数据包...")
+        
+        json_files = sorted(tmp_dir.glob("chunk_*.json")) if tmp_dir.exists() else []
+        if not json_files:
+            print("[阶段2] 未找到JSON文件，无法进行筛选")
+            return self.process_chunked_data()  # 降级到旧流程
+        
+        all_filtered_packets = []
+        all_matched_flags = []
+        match_details = []  # 记录每个匹配的数据包详情
+        
+        # 逐个JSON文件处理
+        for json_file in json_files:
+            try:
+                with open(json_file, 'r', encoding='utf-8') as f:
+                    chunk_data = json_lib.load(f)
+                
+                if not isinstance(chunk_data, list):
+                    chunk_data = [chunk_data]
+                
+                print(f"[阶段2] 处理文件 {json_file.name}，{len(chunk_data)} 个数据包...")
+                
+                # 筛选数据包
+                for packet_idx, packet in enumerate(chunk_data):
+                    packet_str = json_lib.dumps(packet, ensure_ascii=False)
+                    
+                    # 用所有正则进行匹配
+                    matched = False
+                    for regex_pattern in extracted_regexes:
+                        try:
+                            if re_lib.search(regex_pattern, packet_str, re_lib.IGNORECASE):
+                                matched = True
+                                # 提取匹配的内容
+                                matches = re_lib.findall(regex_pattern, packet_str, re_lib.IGNORECASE)
+                                for match in matches:
+                                    if match not in all_matched_flags:
+                                        all_matched_flags.append(match)
+                                break
+                        except:
+                            continue
+                    
+                    if matched:
+                        all_filtered_packets.append(packet)
+                        match_details.append({
+                            'file': json_file.name,
+                            'packet_index': packet_idx + 1,
+                            'matched_content': [m for r in extracted_regexes for m in re_lib.findall(r, packet_str, re_lib.IGNORECASE)]
+                        })
+            except Exception as e:
+                print(f"[阶段2] 处理 {json_file.name} 出错: {e}")
+                continue
+        
+        print(f"\n[阶段2] 筛选结果：匹配到 {len(all_matched_flags)} 个可疑flag，{len(all_filtered_packets)} 个数据包")
+        
+        # 阶段2a：如果已经匹配到flag，展示给用户研判
+        if all_matched_flags:
+            print(f"\n[阶段2a] 正则已匹配到flag，返回数据包供用户研判...")
+            
+            return {
+                "flags": all_matched_flags,
+                "raw_response": f"根据正则筛选，匹配到以下flag：\n" + "\n".join([f"- {f}" for f in all_matched_flags]),
+                "status": "regex_matched",
+                "filtered_packets": all_filtered_packets,
+                "match_details": match_details,
+                "regex_patterns": extracted_regexes,
+                "analysis": f"阶段1：生成了{len(extracted_regexes)}个正则表达式\n阶段2a：正则匹配到{len(all_matched_flags)}个可疑flag，{len(all_filtered_packets)}个相关数据包。请在用户研判界面查看详情。"
+            }
+        
+        # 阶段2b：如果未匹配到flag，继续用筛选后的数据包进行深度AI分析
+        else:
+            print(f"\n[阶段2b] 正则未匹配到flag，继续进行深度AI分析...")
+            
+            if all_filtered_packets:
+                # 使用筛选后的数据包进行深度分析
+                return self._deep_analysis_with_packets(all_filtered_packets, extracted_regexes)
+            else:
+                # 如果筛选后没有数据包，使用原始的分块分析
+                print("[阶段2b] 筛选后无数据包，使用原始分块分析...")
+                return self.process_chunked_data()
+    
+    def _deep_analysis_with_packets(self, filtered_packets, regex_patterns):
+        """对筛选后的数据包进行深度AI分析"""
+        from pathlib import Path
+        import json as json_lib
+        
+        print(f"\n[深度分析] 开始对 {len(filtered_packets)} 个筛选后的数据包进行深度分析...")
+        
+        all_flags = []
+        
+        # 将筛选后的数据包分块（防止上下文超限）
+        chunk_size = 20
+        total_chunks = (len(filtered_packets) + chunk_size - 1) // chunk_size
+        
+        for chunk_idx in range(total_chunks):
+            start = chunk_idx * chunk_size
+            end = min((chunk_idx + 1) * chunk_size, len(filtered_packets))
+            chunk_packets = filtered_packets[start:end]
+            
+            print(f"[深度分析] 处理块 {chunk_idx + 1}/{total_chunks}...")
+            
+            # 构造提示
+            analysis_prompt = f"""【筛选后的数据包分析】
+本块包含 {len(chunk_packets)} 个已筛选的网络数据包。
+
+【已使用的筛选正则】
+{', '.join(regex_patterns)}
+
+【数据包内容】
+{json_lib.dumps(chunk_packets, ensure_ascii=False, indent=2)}
+
+【分析任务】
+对以上数据包进行深度分析，提取所有可能的flag和关键信息：
+1. **直接flag识别**：任何符合flag格式的内容
+2. **隐藏内容**：编码、加密的数据（base64、hex等）
+3. **HTTP分析**：请求参数、响应体、cookie中的敏感信息
+4. **其他线索**：域名、IP、时间序列特征等
+
+【输出格式】
+直接列出发现的所有内容，每行一条。
+"""
+            
+            try:
+                api_result = self.call_iflow_model(analysis_prompt)
+                flags = self.extract_flags_from_result(api_result)
+                all_flags.extend(flags)
+            except Exception as e:
+                print(f"[深度分析] 块分析失败: {e}")
+                continue
+        
+        return {
+            "flags": list(set(all_flags)),
+            "raw_response": f"对{len(filtered_packets)}个筛选后的数据包进行了深度分析，发现{len(set(all_flags))}个可疑flag",
+            "status": "deep_analysis_success",
+            "filtered_packets_count": len(filtered_packets),
+            "regex_patterns": regex_patterns,
+            "analysis": f"正则筛选后进行深度分析：\n - 筛选出 {len(filtered_packets)} 个相关数据包\n - 发现 {len(set(all_flags))} 个可疑flag\n - 使用正则：{', '.join(regex_patterns)}"
+        }
     
     def process_chunked_data(self):
         """处理分块数据 - 逐个JSON文件发送给AI
